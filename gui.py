@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""GenAI Stack GUI — tkinter-based native desktop interface (Windows + Linux).
+"""GenAI Stack GUI — modern tkinter desktop interface.
 
-Zero extra dependencies — uses only Python stdlib + tkinter.
-All HTTP operations run in background threads — UI never blocks.
+Dark sidebar + card layout + async health checks.
+Zero extra deps — Python stdlib only.
 
 Usage:
     uv run python gui.py
@@ -24,734 +24,790 @@ from tui.models import get_models
 from tui.proxy import ProxyManager
 from tui.token_utils import jwt_remaining_str
 
-IS_WINDOWS = os.name == "nt"
+IS_WIN = os.name == "nt"
+FONT = ("Segoe UI", 10) if IS_WIN else ("sans-serif", 10)
+FONT_SM = ("Segoe UI", 9) if IS_WIN else ("sans-serif", 9)
+FONT_BOLD = ("Segoe UI", 10, "bold") if IS_WIN else ("sans-serif", 10, "bold")
+FONT_TITLE = ("Segoe UI", 13, "bold") if IS_WIN else ("sans-serif", 13, "bold")
+FONT_MONO = ("Cascadia Code", 10) if IS_WIN else ("monospace", 10)
+FONT_MONO_SM = ("Cascadia Code", 9) if IS_WIN else ("monospace", 9)
 
-PAD_X = 8
-PAD_Y = 4
-REFRESH_INTERVAL_MS = 3000  # 3 seconds (reduced from 5)
+# ── Color palette ──
+C_SIDEBAR = "#1a1b2e"
+C_SIDEBAR_HL = "#252640"
+C_BG = "#f0f2f5"
+C_CARD = "#ffffff"
+C_TEXT = "#1f2937"
+C_SUBTLE = "#6b7280"
+C_PRIMARY = "#4f6ef7"
+C_PRIMARY_HOVER = "#3b5de7"
+C_SUCCESS = "#10b981"
+C_DANGER = "#ef4444"
+C_WARNING = "#f59e0b"
+C_BORDER = "#e5e7eb"
+C_TAG_GENAI = "#8b5cf6"
+C_TAG_ANTHROPIC = "#3b82f6"
+C_TAG_API = "#06b6d4"
+C_TITLEBAR = "#131428"
 
+REFRESH_MS = 3000
+
+
+# ── Helpers ──────────────────────────────────────
+
+def _tag_color(ptype: str) -> str:
+    return {"genai": C_TAG_GENAI, "genai-api": C_TAG_API,
+            "openai": C_TAG_API, "anthropic": C_TAG_ANTHROPIC}.get(ptype, C_SUBTLE)
+
+
+def _status_dot(on: bool) -> str:
+    return "●" if on else "○"
+
+
+def _status_color(on: bool) -> str:
+    return C_SUCCESS if on else C_DANGER
+
+
+# ─────────────────────────────────────────────
+# Main window
+# ─────────────────────────────────────────────
 
 class GenAIStackGUI(tk.Tk):
-    """GenAI Stack 桌面管理面板。"""
-
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
+        self.title("GenAI Stack")
+        self.geometry("980x680")
+        self.minsize(820, 520)
+        self.configure(bg=C_BG)
 
-        self.title("GenAI Stack Dashboard")
-        self.geometry("960x680")
-        self.minsize(800, 520)
+        self.pm = ProxyManager()
+        self._cur: cfg.Profile | None = None
+        self._rid: str | None = None
+        self._hc: dict = {"shtu_proxy": False, "genai2api": False}
 
-        self.proxy_mgr = ProxyManager()
-        self._current_profile: cfg.Profile | None = None
-        self._refresh_id: str | None = None
-        self._health_cache: dict[str, bool] = {"shtu_proxy": False, "genai2api": False}
-        self._busy = False  # guard against concurrent refresh
+        self._build_styles()
+        self._build_titlebar()
+        self._build_layout()
+        self.after(80, self._async_refresh_all)
+        self._schedule_health()
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
-        self._setup_style()
-        self._build_menubar()
-        self._build_statusbar()
-        self._build_main()
+    # ── Styles ──
 
-        # Async initial load — don't block window appearance
-        self.after(100, self._async_refresh_all)
-        self._schedule_health_refresh()
+    def _build_styles(self):
+        s = ttk.Style(self)
+        if IS_WIN:
+            for t_ in ("vista", "xpnative", "clam"):
+                if t_ in s.theme_names(): s.theme_use(t_); break
+        s.configure("TFrame", background=C_BG)
+        s.configure("Sidebar.TFrame", background=C_SIDEBAR)
+        s.configure("Card.TFrame", background=C_CARD)
+        s.configure("TitleBar.TFrame", background=C_TITLEBAR)
+        s.configure("TLabel", background=C_BG, foreground=C_TEXT, font=FONT)
+        s.configure("SidebarLbl.TLabel", background=C_SIDEBAR, foreground="#c8c8d4", font=FONT)
+        s.configure("SidebarHd.TLabel", background=C_SIDEBAR, foreground="#ffffff", font=FONT_BOLD)
+        s.configure("CardHd.TLabel", background=C_CARD, foreground=C_TEXT, font=FONT_BOLD)
+        s.configure("CardBody.TLabel", background=C_CARD, foreground=C_TEXT, font=FONT_MONO_SM)
+        s.configure("Subtitle.TLabel", foreground=C_SUBTLE, font=FONT_SM)
+        s.configure("Title.TLabel", background=C_TITLEBAR, foreground="#ffffff", font=FONT_TITLE)
+        s.configure("Tag.TLabel", font=FONT_SM)
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        s.configure("Primary.TButton", font=FONT_BOLD, padding=(14, 6))
+        s.configure("Sidebar.TButton", font=FONT_SM, padding=(6, 3))
+        s.map("Primary.TButton",
+              background=[("active", C_PRIMARY_HOVER), ("!active", C_PRIMARY)],
+              foreground=[("active", "#fff"), ("!active", "#fff")])
 
-    # ═══════ Style ═══════
+    # ── Title bar ──
 
-    def _setup_style(self) -> None:
-        self.style = ttk.Style(self)
-        if IS_WINDOWS:
-            for theme in ("vista", "xpnative", "clam"):
-                if theme in self.style.theme_names():
-                    self.style.theme_use(theme)
-                    break
-        self.configure(bg="#f0f0f0")
-        self.style.configure("Status.TLabel", font=("Segoe UI", 10) if IS_WINDOWS else ("sans-serif", 10))
-        self.style.configure("Heading.TLabel", font=("Segoe UI", 11, "bold") if IS_WINDOWS else ("sans-serif", 11, "bold"))
+    def _build_titlebar(self):
+        bar = ttk.Frame(self, style="TitleBar.TFrame")
+        bar.pack(fill=tk.X)
+        inner = ttk.Frame(bar, style="TitleBar.TFrame")
+        inner.pack(fill=tk.X, padx=20, pady=(10, 8))
+        ttk.Label(inner, text="⚡ GenAI Stack", style="Title.TLabel").pack(side=tk.LEFT)
+        self._title_status = ttk.Label(inner, foreground="#8b8fa3",
+                                       background=C_TITLEBAR, font=FONT_SM)
+        self._title_status.pack(side=tk.RIGHT)
 
-    # ═══════ Menu bar ═══════
+    # ── Layout ──
 
-    def _build_menubar(self) -> None:
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
+    def _build_layout(self):
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="New Profile...", command=self._new_profile, accelerator="Ctrl+N")
-        file_menu.add_command(label="Edit Profile...", command=self._edit_profile, accelerator="Ctrl+E")
-        file_menu.add_command(label="Delete Profile", command=self._delete_profile, accelerator="Del")
-        file_menu.add_separator()
-        file_menu.add_command(label="Refresh (F5)", command=self._async_refresh_all)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self._on_close, accelerator="Ctrl+Q")
-        menubar.add_cascade(label="File", menu=file_menu)
+        # Sidebar
+        sidebar = ttk.Frame(body, style="Sidebar.TFrame", width=220)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+        self._build_sidebar(sidebar)
 
-        proxy_menu = tk.Menu(menubar, tearoff=0)
-        proxy_menu.add_command(label="Start Proxy", command=self._start_proxy)
-        proxy_menu.add_command(label="Stop Proxy", command=self._stop_proxy)
-        proxy_menu.add_command(label="Restart Proxy", command=self._restart_proxy)
-        menubar.add_cascade(label="Proxy", menu=proxy_menu)
+        # Content
+        content = ttk.Frame(body)
+        content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0))
+        self._build_content(content)
 
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        tools_menu.add_command(label="Backup Config...", command=self._backup_config)
-        tools_menu.add_command(label="Restore Config...", command=self._restore_config)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
+        # Bottom bar
+        self._build_bottombar()
 
-        help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="About", command=self._show_about)
-        menubar.add_cascade(label="Help", menu=help_menu)
+    # ── Sidebar ──
 
-        self.bind_all("<Control-n>", lambda e: self._new_profile())
-        self.bind_all("<Control-e>", lambda e: self._edit_profile())
-        self.bind_all("<Control-q>", lambda e: self._on_close())
-        self.bind_all("<F5>", lambda e: self._async_refresh_all())
+    def _build_sidebar(self, parent: ttk.Frame):
+        # Header
+        hdr = ttk.Frame(parent, style="Sidebar.TFrame")
+        hdr.pack(fill=tk.X, padx=16, pady=(16, 8))
+        ttk.Label(hdr, text="PROFILES", style="SidebarHd.TLabel").pack(side=tk.LEFT)
+        ttk.Button(hdr, text="＋", width=3, style="Sidebar.TButton",
+                   command=self._new_profile).pack(side=tk.RIGHT)
 
-    # ═══════ Status bar ═══════
+        # List
+        lf = ttk.Frame(parent, style="Sidebar.TFrame")
+        lf.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
 
-    def _build_statusbar(self) -> None:
-        self.status_frame = ttk.Frame(self)
-        self.status_frame.pack(side=tk.TOP, fill=tk.X, padx=PAD_X, pady=(PAD_Y, 0))
-        self.status_label = ttk.Label(self.status_frame, text="Ready", style="Status.TLabel")
-        self.status_label.pack(side=tk.LEFT, fill=tk.X)
-
-    # ═══════ Main layout ═══════
-
-    def _build_main(self) -> None:
-        pw = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        pw.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=PAD_X, pady=PAD_Y)
-        self._build_left_panel(pw)
-        self._build_right_panel(pw)
-        self._build_bottom_bar()
-
-    def _build_left_panel(self, parent: ttk.PanedWindow) -> None:
-        frame = ttk.LabelFrame(parent, text="Profiles", padding=4)
-        parent.add(frame, weight=1)
-
-        list_frame = ttk.Frame(frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.profile_listbox = tk.Listbox(
-            list_frame,
-            font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
-            activestyle="none", exportselection=False,
+        self._plist = tk.Listbox(
+            lf,
+            bg=C_SIDEBAR, fg="#d0d0dc",
+            selectbackground=C_SIDEBAR_HL, selectforeground="#ffffff",
+            font=FONT_MONO,
+            activestyle="none", highlightthickness=0,
+            borderwidth=0, relief=tk.FLAT,
+            exportselection=False,
         )
-        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.profile_listbox.yview)
-        self.profile_listbox.configure(yscrollcommand=sb.set)
-        self.profile_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self._plist.yview)
+        self._plist.configure(yscrollcommand=sb.set)
+        self._plist.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.profile_listbox.bind("<<ListboxSelect>>", self._on_profile_select)
-        self.profile_listbox.bind("<Double-1>", lambda e: self._activate_profile())
+        self._plist.bind("<<ListboxSelect>>", self._on_select)
+        self._plist.bind("<Double-1>", lambda e: self._activate())
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, pady=(PAD_Y, 0))
-        for txt, cmd in [("★ Activate", self._activate_profile),
-                         ("+ New", self._new_profile),
+        # Buttons
+        bf = ttk.Frame(parent, style="Sidebar.TFrame")
+        bf.pack(fill=tk.X, padx=10, pady=(0, 16))
+        for txt, cmd in [("★ Activate", self._activate),
                          ("✎ Edit", self._edit_profile),
                          ("✕ Delete", self._delete_profile),
                          ("🔑 Token", self._update_token)]:
-            ttk.Button(btn_frame, text=txt, command=cmd).pack(side=tk.LEFT, padx=1)
+            ttk.Button(bf, text=txt, style="Sidebar.TButton",
+                       command=cmd).pack(fill=tk.X, pady=1)
 
-    def _build_right_panel(self, parent: ttk.PanedWindow) -> None:
-        rf = ttk.Frame(parent)
-        parent.add(rf, weight=2)
+    # ── Content ──
 
-        # Profile Detail
-        df = ttk.LabelFrame(rf, text="Profile Detail", padding=4)
-        df.pack(fill=tk.BOTH, expand=True, pady=(0, PAD_Y))
-        self.detail_text = tk.Text(df, height=7, font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
-                                   state=tk.DISABLED, wrap=tk.WORD)
-        self.detail_text.pack(fill=tk.BOTH, expand=True)
+    def _build_content(self, parent: ttk.Frame):
+        cf = ttk.Frame(parent)
+        cf.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
 
-        # Proxy Status
-        pf = ttk.LabelFrame(rf, text="Proxy Status", padding=4)
-        pf.pack(fill=tk.BOTH, pady=(0, PAD_Y))
-        self.proxy_status_text = tk.Text(pf, height=5, font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
-                                         state=tk.DISABLED, wrap=tk.WORD)
-        self.proxy_status_text.pack(fill=tk.BOTH)
+        # Row 1: Profile Detail + Proxy Status
+        row1 = ttk.Frame(cf)
+        row1.pack(fill=tk.X, pady=(0, 12))
+        self._card_detail(row1)
+        self._card_proxy(row1)
 
-        # Model Select
-        mf = ttk.LabelFrame(rf, text="Model Select", padding=4)
-        mf.pack(fill=tk.BOTH)
-        row = ttk.Frame(mf)
-        row.pack(fill=tk.X, pady=(0, PAD_Y))
-        ttk.Label(row, text="Model:").pack(side=tk.LEFT, padx=(0, 4))
+        # Row 2: Model + quick actions
+        row2 = ttk.Frame(cf)
+        row2.pack(fill=tk.X)
+        self._card_model(row2)
+
+    def _card_frame(self, parent, title: str, side=tk.LEFT, expand=True, padx=(0, 0), w=None):
+        """Create a white card with header."""
+        outer = ttk.Frame(parent)
+        outer.pack(side=side, fill=tk.BOTH if expand else tk.Y,
+                   expand=expand, padx=padx)
+        if w:
+            outer.configure(width=w)
+            outer.pack_propagate(False)
+
+        card = tk.Frame(outer, bg=C_CARD, highlightbackground=C_BORDER,
+                        highlightthickness=1, bd=0)
+        card.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        hdr = tk.Frame(card, bg=C_CARD, bd=0)
+        hdr.pack(fill=tk.X, padx=14, pady=(12, 6))
+        tk.Label(hdr, text=title, font=FONT_BOLD, bg=C_CARD,
+                 fg=C_TEXT).pack(side=tk.LEFT)
+        return card
+
+    def _card_detail(self, parent):
+        card = self._card_frame(parent, "📋 Profile Detail", side=tk.LEFT,
+                                expand=True, padx=(0, 6))
+
+        self._detail_text = tk.Text(
+            card, height=9,
+            font=FONT_MONO,
+            bg=C_CARD, fg=C_TEXT,
+            relief=tk.FLAT, borderwidth=0,
+            wrap=tk.WORD, state=tk.DISABLED,
+            padx=14, pady=4,
+        )
+        self._detail_text.pack(fill=tk.BOTH, expand=True)
+        # Tag colors
+        self._detail_text.tag_configure("key", foreground=C_SUBTLE)
+        self._detail_text.tag_configure("val", foreground=C_TEXT)
+
+    def _card_proxy(self, parent):
+        card = self._card_frame(parent, "🔌 Proxy Status", side=tk.LEFT,
+                                expand=False, w=280)
+
+        inner = tk.Frame(card, bg=C_CARD)
+        inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
+
+        self._proxy_labels: dict[str, tuple[tk.Label, tk.Label]] = {}
+
+        def _row(label, port):
+            f = tk.Frame(inner, bg=C_CARD)
+            f.pack(fill=tk.X, pady=3)
+            dot_lbl = tk.Label(f, text="○", font=("sans-serif", 12), bg=C_CARD, fg=C_DANGER)
+            dot_lbl.pack(side=tk.LEFT, padx=(0, 6))
+            tk.Label(f, text=f"{label}  ", font=FONT_BOLD, bg=C_CARD, fg=C_TEXT).pack(side=tk.LEFT)
+            st_lbl = tk.Label(f, text="Checking...", font=FONT_SM, bg=C_CARD, fg=C_SUBTLE)
+            st_lbl.pack(side=tk.RIGHT)
+            self._proxy_labels[label] = (dot_lbl, st_lbl)
+
+        _row("genai2api", 5000)
+        _row("SHTUProxy", 8082)
+
+        # JWT
+        jf = tk.Frame(inner, bg=C_CARD)
+        jf.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(jf, text="JWT Status", font=FONT_SM, bg=C_CARD, fg=C_SUBTLE).pack(anchor=tk.W)
+        self._jwt_label = tk.Label(jf, text="—", font=FONT_BOLD, bg=C_CARD, fg=C_TEXT)
+        self._jwt_label.pack(anchor=tk.W)
+
+    def _card_model(self, parent):
+        card = self._card_frame(parent, "🧠 Model", side=tk.LEFT, expand=True)
+
+        inner = tk.Frame(card, bg=C_CARD)
+        inner.pack(fill=tk.X, padx=14, pady=(0, 12))
+
         self.model_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(row, textvariable=self.model_var, state="readonly", width=30)
-        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(row, text="Switch Model", command=self._switch_model).pack(side=tk.RIGHT)
+        cb = ttk.Combobox(inner, textvariable=self.model_var, state="readonly",
+                          font=FONT, width=36)
+        cb.pack(side=tk.LEFT, padx=(0, 8))
 
-    def _build_bottom_bar(self) -> None:
-        bar = ttk.Frame(self)
-        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=PAD_X, pady=(0, PAD_Y))
-        for txt, cmd in [("▶ Start", self._start_proxy),
-                         ("■ Stop", self._stop_proxy),
-                         ("↻ Restart", self._restart_proxy),
-                         ("↺ Refresh", self._async_refresh_all)]:
-            ttk.Button(bar, text=txt, command=cmd).pack(side=tk.LEFT, padx=2)
-        ttk.Label(bar, text="").pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.auto_refresh_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="Auto-refresh (3s)", variable=self.auto_refresh_var).pack(side=tk.RIGHT)
+        ttk.Button(inner, text="Switch", style="Primary.TButton",
+                   command=self._switch_model).pack(side=tk.LEFT)
 
-    # ═══════ Async operations (NON-BLOCKING) ═══════
+        # Quick status
+        self._model_status = tk.Label(card, text="", font=FONT_SM, bg=C_CARD, fg=C_SUBTLE)
+        self._model_status.pack(anchor=tk.W, padx=14, pady=(0, 8))
 
-    def _async_refresh_all(self) -> None:
-        """Kick off all async refreshes without blocking."""
-        self._refresh_profiles()       # fast — disk only
-        self._update_statusbar()       # fast
-        self._update_detail()          # fast
-        self._async_health_check()     # background HTTP
-        self._async_refresh_models()   # background HTTP
+    # ── Bottom bar ──
 
-    def _async_health_check(self) -> None:
-        """Run health checks in background thread, update UI via after()."""
-        def _run() -> dict[str, bool]:
-            return self.proxy_mgr.health_check()
+    def _build_bottombar(self):
+        bar = tk.Frame(self, bg=C_TITLEBAR, height=44)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        bar.pack_propagate(False)
 
-        def _done() -> None:
-            t = getattr(self, '_hc_thread', None)
-            if t and t.is_alive():
-                return  # skip if still running
-            try:
-                health = t.result_cache
-            except AttributeError:
+        inner = tk.Frame(bar, bg=C_TITLEBAR)
+        inner.pack(fill=tk.BOTH, padx=16, pady=6)
+
+        for txt, cmd in [("▶  Start", self._start_proxy),
+                         ("■  Stop", self._stop_proxy),
+                         ("↻  Restart", self._restart_proxy)]:
+            btn = tk.Button(inner, text=txt, font=FONT_SM,
+                            bg=C_PRIMARY, fg="#fff",
+                            activebackground=C_PRIMARY_HOVER, activeforeground="#fff",
+                            relief=tk.FLAT, bd=0, padx=14, pady=4,
+                            cursor="hand2", command=cmd)
+            btn.pack(side=tk.LEFT, padx=3)
+
+        tk.Label(inner, text="", bg=C_TITLEBAR).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._auto_var = tk.BooleanVar(value=True)
+        cb = tk.Checkbutton(inner, text="Auto 3s", variable=self._auto_var,
+                            font=FONT_SM, bg=C_TITLEBAR, fg="#8b8fa3",
+                            selectcolor=C_SIDEBAR, activebackground=C_TITLEBAR,
+                            activeforeground="#fff")
+        cb.pack(side=tk.RIGHT)
+
+        tk.Button(inner, text="↺", font=FONT_BOLD, bg=C_TITLEBAR, fg="#8b8fa3",
+                  activebackground=C_SIDEBAR_HL, relief=tk.FLAT, bd=0, padx=8,
+                  cursor="hand2", command=self._async_refresh_all).pack(side=tk.RIGHT)
+
+    # ═══════ Async ops (NEVER block UI) ═══════
+
+    def _async_refresh_all(self):
+        self._refresh_profiles()
+        self._update_detail()
+        self._update_titlebar()
+        self._async_health()
+        self._async_models()
+
+    def _async_health(self):
+        def _run():
+            return self.pm.health_check()
+
+        def _done():
+            if hasattr(self, '_hct') and self._hct.is_alive():
                 return
-            self._health_cache = health
-            shtu = "✓ Running" if health["shtu_proxy"] else "✗ Not running"
-            genai2 = "✓ Running" if health["genai2api"] else "✗ Not running"
-            lines = [
-                f"  SHTUClaudeProxy (:8082):  {shtu}",
-                f"  genai2api (:5000):        {genai2}",
-            ]
-            token = cfg.read_genai_token()
-            if token:
-                try:
-                    lines.append(f"  JWT status:              {jwt_remaining_str(token)}")
-                except Exception:
-                    pass
-            self._set_text(self.proxy_status_text, "\n".join(lines))
+            self._hc = self._hct.result_cache if hasattr(self._hct, 'result_cache') else self._hc
+            self._update_proxy_display()
 
-        self._hc_thread = threading.Thread(target=lambda: (
-            setattr(self._hc_thread, 'result_cache', _run()),
-            self.after(0, _done),
+        t = threading.Thread(target=lambda: (
+            setattr(t, 'result_cache', _run()),
+            self.after(0, _done)
         ), daemon=True)
-        self._hc_thread.start()
+        self._hct = t
+        t.start()
 
-    def _async_refresh_models(self) -> None:
-        """Fetch models in background thread."""
-        def _run() -> tuple[str | None, int | None, str | None, str | None, bool]:
+    def _async_models(self):
+        def _run():
             active = cfg.get_active_profile()
-            proxy_port = None
-            profile_type = None
-            profile_url = ""
-            profile_key = ""
-            has_custom = False
+            pt, pp, url, key, hc = None, None, "", "", False
             if active:
                 p = cfg.load_profile(active)
                 if p:
-                    profile_type = p.type
-                    profile_url = p.url
-                    profile_key = p.key
-                    if p.type == "genai" and self._health_cache.get("genai2api", False):
-                        proxy_port = cfg.GENAI2API_PORT
-                    elif p.type in ("genai-api", "openai") and self._health_cache.get("shtu_proxy", False):
-                        proxy_port = cfg.SHTU_PROXY_PORT
+                    pt = p.type
+                    url = p.url
+                    key = p.key
+                    if p.type == "genai" and self._hc.get("genai2api", False):
+                        pp = cfg.GENAI2API_PORT
+                    elif p.type in ("genai-api", "openai") and self._hc.get("shtu_proxy", False):
+                        pp = cfg.SHTU_PROXY_PORT
                     if p.type == "anthropic":
-                        has_custom = bool(p.model)
-            return profile_type, proxy_port, profile_url, profile_key, has_custom
+                        hc = bool(p.model)
+            return pt, pp, url, key, hc
 
-        def _done() -> None:
-            profile_type, proxy_port, profile_url, profile_key, has_custom = self._model_fetch_result
-            models = get_models(
-                proxy_port, profile_type, has_custom,
-                profile_url=profile_url, profile_key=profile_key,
-            )
-            flat = []
-            for gm in models.values():
-                flat.extend(gm)
+        def _done():
+            pt, pp, url, key, hc = self._mres
+            models = get_models(pp, pt, hc, profile_url=url, profile_key=key)
+            flat = [m for gm in models.values() for m in gm]
             self.model_combo["values"] = flat
-
             active = cfg.get_active_profile()
+            cur = ""
             if active:
                 p = cfg.load_profile(active)
-                if p and p.display_model in flat:
-                    self.model_var.set(p.display_model)
-                elif flat:
-                    self.model_var.set(flat[0])
+                if p:
+                    cur = p.display_model
+                    # Show sub-models info
+                    mid = p.middle_model or ""
+                    sml = p.small_model or ""
+                    parts = [f"Big: {cur}"]
+                    if mid and mid != cur:
+                        parts.append(f"Mid: {mid}")
+                    if sml and sml != cur:
+                        parts.append(f"Small: {sml}")
+                    self._model_status.configure(text="  |  ".join(parts))
+            if cur in flat:
+                self.model_var.set(cur)
+            elif flat:
+                self.model_var.set(flat[0])
 
-        def _fetch() -> None:
-            self._model_fetch_result = _run()
+        def _fetch():
+            self._mres = _run()
             self.after(0, _done)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
-    # ═══════ Auto-refresh (non-blocking) ═══════
+    # ── Schedule ──
 
-    def _schedule_health_refresh(self) -> None:
-        """Schedule periodic health refresh — async, never blocks UI."""
-        if self.auto_refresh_var.get():
-            self._async_health_check()
-        self._refresh_id = self.after(REFRESH_INTERVAL_MS, self._schedule_health_refresh)
+    def _schedule_health(self):
+        if self._auto_var.get():
+            self._async_health()
+        self._rid = self.after(REFRESH_MS, self._schedule_health)
 
-    # ═══════ Sync UI updates (fast, disk only) ═══════
+    # ── Update displays ──
 
-    def _refresh_profiles(self) -> None:
-        selected = self._get_selected_profile_name()
-        self.profile_listbox.delete(0, tk.END)
+    def _refresh_profiles(self):
+        sel = self._get_sel()
+        self._plist.delete(0, tk.END)
         active = cfg.get_active_profile()
         for p in cfg.list_profiles():
-            prefix = "★ " if p.name == active else "  "
-            self.profile_listbox.insert(tk.END, f"{prefix}{p.name:<14} [{p.type}]")
-        if selected:
-            for i in range(self.profile_listbox.size()):
-                if selected in self.profile_listbox.get(i):
-                    self.profile_listbox.selection_set(i)
-                    break
-        if not self.profile_listbox.curselection() and self.profile_listbox.size() > 0:
-            self.profile_listbox.selection_set(0)
-            self._on_profile_select()
+            marker = "★ " if p.name == active else "  "
+            self._plist.insert(tk.END, f"{marker}{p.name}")
+        if sel:
+            for i in range(self._plist.size()):
+                if sel in self._plist.get(i):
+                    self._plist.selection_set(i); break
+        if not self._plist.curselection() and self._plist.size() > 0:
+            self._plist.selection_set(0)
+            self._on_select()
 
-    def _update_statusbar(self) -> None:
+    def _update_detail(self):
+        name = self._get_sel()
+        if not name:
+            self._detail_text.configure(state=tk.NORMAL)
+            self._detail_text.delete("1.0", tk.END)
+            self._detail_text.insert("1.0", "\n  (select a profile)")
+            self._detail_text.configure(state=tk.DISABLED)
+            return
+        p = cfg.load_profile(name)
+        if not p:
+            return
+        self._cur = p
+        data = p.to_json()
+        tag_color = _tag_color(p.type)
+
+        lines = [f"  Profile:  {p.name}"]
+        lines.append(f"  Type:     {p.type}")
+        for k, v in data.items():
+            if k in ("type",):
+                continue
+            if k == "key" and v:
+                v = v if len(v) <= 16 else v[:12] + f"…({len(v)} chars)"
+            lines.append(f"  {k}:  {v}")
+
+        self._detail_text.configure(state=tk.NORMAL)
+        self._detail_text.delete("1.0", tk.END)
+        self._detail_text.insert("1.0", "\n".join(lines))
+        self._detail_text.configure(state=tk.DISABLED)
+
+        # Update type tag in status
+        self._title_status.configure(text=f"{p.type}  ·  {p.display_model}")
+
+    def _update_proxy_display(self):
+        h = self._hc
+        for name, key in [("genai2api", "genai2api"), ("SHTUProxy", "shtu_proxy")]:
+            pair = self._proxy_labels.get(name)
+            if not pair:
+                continue
+            dot, st = pair
+            on = h.get(key, False)
+            dot.configure(text=_status_dot(on), fg=_status_color(on))
+            st.configure(text="Running" if on else "Stopped",
+                         fg=_status_color(on))
+
+        token = cfg.read_genai_token()
+        if token:
+            try:
+                self._jwt_label.configure(text=jwt_remaining_str(token))
+            except Exception:
+                pass
+        else:
+            self._jwt_label.configure(text="No token", fg=C_SUBTLE)
+
+    def _update_titlebar(self):
         active = cfg.get_active_profile()
         if active and cfg.profile_exists(active):
             p = cfg.load_profile(active)
             if p:
-                self.status_label.configure(
-                    text=f"★ Active: {active}  |  Type: {p.type}  |  Model: {p.display_model}"
-                )
-                return
-        self.status_label.configure(text="No active profile. Select one and click ★ Activate.")
+                self._title_status.configure(text=f"{p.type}  ·  {p.display_model}")
 
-    def _update_detail(self) -> None:
-        name = self._get_selected_profile_name()
-        if not name:
-            self._set_text(self.detail_text, "(no profile selected)")
-            return
-        p = cfg.load_profile(name)
-        if not p:
-            return
-        data = p.to_json()
-        lines = []
-        for k, v in data.items():
-            if k == "key" and v:
-                v = v if len(v) <= 16 else v[:12] + f"...({len(v)} chars)"
-            lines.append(f"  {k}: {v}")
-        self._set_text(self.detail_text, "\n".join(lines))
-        self._current_profile = p
+    # ── Profile actions ──
 
-    # ═══════ Profile actions ═══════
-
-    def _get_selected_profile_name(self) -> str | None:
-        sel = self.profile_listbox.curselection()
-        if not sel:
+    def _get_sel(self) -> str | None:
+        s = self._plist.curselection()
+        if not s:
             return None
-        return self.profile_listbox.get(sel[0]).lstrip("★ ").split()[0].strip() or None
+        return self._plist.get(s[0]).lstrip("★ ").strip() or None
 
-    def _on_profile_select(self, event=None) -> None:
+    def _on_select(self, e=None):
         self._update_detail()
 
-    def _activate_profile(self) -> None:
-        name = self._get_selected_profile_name()
+    def _activate(self):
+        name = self._get_sel()
         if not name:
-            messagebox.showwarning("Activate", "Please select a profile first."); return
-        if not messagebox.askyesno("Activate", f"Activate '{name}'?\nWill stop current proxies and switch config."):
-            return
+            messagebox.showwarning("Activate", "Select a profile."); return
+        if not messagebox.askyesno("Activate", f"Activate '{name}'?"): return
         p = cfg.load_profile(name)
-        if not p:
-            return
-        self.status_label.configure(text=f"Switching to {name}...")
-        self._busy = True
+        if not p: return
+
+        self._title_status.configure(text=f"Switching...")
 
         def _run():
-            ok, msg = self.proxy_mgr.smart_switch(p)
+            ok, msg = self.pm.smart_switch(p)
             self.after(0, lambda: self._on_activate_done(ok, msg, p))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_activate_done(self, ok: bool, msg: str, profile: cfg.Profile) -> None:
-        self._busy = False
+    def _on_activate_done(self, ok, msg, p):
         if ok:
-            self.status_label.configure(text=f"✓ {msg}. Restart Claude Code to take effect.")
+            self._title_status.configure(text=f"✓ {p.type} · {p.display_model}")
         else:
-            messagebox.showerror("Activation Failed", msg)
+            messagebox.showerror("Failed", msg)
         self._async_refresh_all()
 
-    def _new_profile(self) -> None:
-        dlg = ProfileDialog(self, title="New Profile")
-        self.wait_window(dlg)
-        if dlg.result:
-            cfg.save_profile(dlg.result)
+    def _new_profile(self):
+        d = ProfileDialog(self)
+        self.wait_window(d)
+        if d.result:
+            cfg.save_profile(d.result)
             self._async_refresh_all()
-            self.status_label.configure(text=f"✓ Profile '{dlg.result.name}' created.")
 
-    def _edit_profile(self) -> None:
-        name = self._get_selected_profile_name()
+    def _edit_profile(self):
+        name = self._get_sel()
         if not name: messagebox.showwarning("Edit", "Select a profile."); return
         p = cfg.load_profile(name)
         if not p: return
-        dlg = ProfileDialog(self, title=f"Edit: {name}", edit_profile=p)
-        self.wait_window(dlg)
-        if dlg.result:
-            cfg.save_profile(dlg.result)
+        d = ProfileDialog(self, edit_profile=p)
+        self.wait_window(d)
+        if d.result:
+            cfg.save_profile(d.result)
             self._async_refresh_all()
-            self.status_label.configure(text=f"✓ Profile '{dlg.result.name}' updated.")
 
-    def _delete_profile(self) -> None:
-        name = self._get_selected_profile_name()
-        if not name: messagebox.showwarning("Delete", "Select a profile."); return
+    def _delete_profile(self):
+        name = self._get_sel()
+        if not name: return
         if name == cfg.get_active_profile():
-            messagebox.showerror("Delete", f"'{name}' is active. Switch first."); return
+            messagebox.showerror("Delete", f"'{name}' is active."); return
         if messagebox.askyesno("Delete", f"Delete '{name}'?", icon="warning"):
             cfg.delete_profile(name)
             self._async_refresh_all()
-            self.status_label.configure(text=f"✓ Profile '{name}' deleted.")
 
-    def _update_token(self) -> None:
-        name = self._get_selected_profile_name()
-        if not name: messagebox.showwarning("Token", "Select a profile."); return
+    def _update_token(self):
+        name = self._get_sel()
+        if not name: return
         p = cfg.load_profile(name)
         if not p: return
-        dlg = TokenDialog(self, title=f"Update Token: {name}", current_token=p.key)
-        self.wait_window(dlg)
-        if dlg.result:
-            p.key = dlg.result
-            cfg.save_profile(p)
-            active = cfg.get_active_profile()
-            if name == active:
-                if p.type == "genai": cfg.write_genai_token(dlg.result)
+        d = TokenDialog(self, current=cfg.read_genai_token() if p.type == "genai" else p.key)
+        self.wait_window(d)
+        if d.result:
+            p.key = d.result; cfg.save_profile(p)
+            if name == cfg.get_active_profile():
+                if p.type == "genai": cfg.write_genai_token(d.result)
                 elif p.type == "genai-api": cfg.write_shtu_proxy_config(p)
             self._async_refresh_all()
-            self.status_label.configure(text=f"✓ Token updated for '{name}'.")
 
-    # ═══════ Model ═══════
+    # ── Model ──
 
-    def _switch_model(self) -> None:
-        model = self.model_var.get()
-        if not model: messagebox.showwarning("Model", "Select a model."); return
+    def _switch_model(self):
+        m = self.model_var.get()
+        if not m: return
         active = cfg.get_active_profile()
-        if not active: messagebox.showwarning("Model", "No active profile."); return
+        if not active: return
         p = cfg.load_profile(active)
         if not p: return
-        if not messagebox.askyesno("Switch Model", f"Switch '{active}' to '{model}'?\nMay restart proxies."):
-            return
-        self.status_label.configure(text=f"Switching model to {model}...")
+        if not messagebox.askyesno("Switch", f"Switch to '{m}'?"): return
+        self._model_status.configure(text="Switching...")
 
         def _run():
-            ok, msg = self.proxy_mgr.switch_model(p, model)
+            ok, msg = self.pm.switch_model(p, m)
             self.after(0, lambda: self._on_switch_done(ok, msg))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_switch_done(self, ok: bool, msg: str) -> None:
-        if ok:
-            self.status_label.configure(text=f"✓ {msg}")
-        else:
-            messagebox.showerror("Switch Failed", msg)
+    def _on_switch_done(self, ok, msg):
+        self._model_status.configure(text=msg if ok else f"✗ {msg}")
         self._async_refresh_all()
 
-    # ═══════ Proxy ═══════
+    # ── Proxy ──
 
-    def _start_proxy(self) -> None:
-        active = cfg.get_active_profile()
-        if not active: messagebox.showwarning("Start", "No active profile."); return
-        p = cfg.load_profile(active)
+    def _start_proxy(self):
+        p = self._active_p()
         if not p: return
-        self.status_label.configure(text="Starting proxy...")
-        self._busy = True
 
         def _run():
-            ok = self.proxy_mgr.smart_start(p)
-            self.after(0, lambda: self._on_proxy_done("✓ Proxy started" if ok else "✗ Start failed", ok))
+            ok = self.pm.smart_start(p)
+            self.after(0, lambda: self._title_status.configure(
+                text="✓ Proxy started" if ok else "✗ Start failed"))
+            self.after(100, self._async_health)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _stop_proxy(self) -> None:
-        self._busy = True
-
+    def _stop_proxy(self):
         def _run():
-            self.proxy_mgr.stop_all()
-            self.after(0, lambda: self._on_proxy_done("All proxies stopped.", True))
+            self.pm.stop_all()
+            self.after(0, lambda: self._title_status.configure(text="Stopped"))
+            self.after(100, self._async_health)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _restart_proxy(self) -> None:
-        active = cfg.get_active_profile()
-        if not active: messagebox.showwarning("Restart", "No active profile."); return
-        p = cfg.load_profile(active)
+    def _restart_proxy(self):
+        p = self._active_p()
         if not p: return
-        self.status_label.configure(text="Restarting proxy...")
-        self._busy = True
 
         def _run():
-            self.proxy_mgr.stop_all()
-            time.sleep(1)
-            ok = self.proxy_mgr.smart_start(p)
-            self.after(0, lambda: self._on_proxy_done("✓ Proxy restarted" if ok else "✗ Restart failed", ok))
+            self.pm.stop_all(); time.sleep(1)
+            ok = self.pm.smart_start(p)
+            self.after(0, lambda: self._title_status.configure(
+                text="✓ Restarted" if ok else "✗ Failed"))
+            self.after(100, self._async_health)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_proxy_done(self, msg: str, ok: bool) -> None:
-        self._busy = False
-        self.status_label.configure(text=msg)
-        self._async_health_check()
+    def _active_p(self):
+        active = cfg.get_active_profile()
+        if not active:
+            messagebox.showwarning("Proxy", "No active profile."); return None
+        return cfg.load_profile(active)
 
-    # ═══════ Config backup / restore ═══════
+    # ── Backup / Restore ──
 
-    def _backup_config(self) -> None:
-        """Export all profiles to a portable JSON file."""
-        path = filedialog.asksaveasfilename(
-            title="Backup Config",
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            initialfile="genai-stack-backup.json",
-        )
-        if not path:
-            return
-        profiles_data = {}
-        for p in cfg.list_profiles():
-            profiles_data[p.name] = p.to_json()
-        backup = {
-            "version": "7.0.0",
-            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "active_profile": cfg.get_active_profile(),
-            "profiles": profiles_data,
-        }
-        try:
-            Path(path).write_text(json.dumps(backup, indent=2, ensure_ascii=False), encoding="utf-8")
-            messagebox.showinfo("Backup", f"Exported {len(profiles_data)} profiles to:\n{path}")
-            self.status_label.configure(text=f"✓ Config backed up to {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Backup Failed", str(e))
+    def backup_config(self):
+        p = filedialog.asksaveasfilename(defaultextension=".json",
+                                         filetypes=[("JSON", "*.json")],
+                                         initialfile="genai-backup.json")
+        if not p: return
+        data = {"v": "7.0.0", "date": time.strftime("%Y-%m-%d %H:%M"),
+                "active": cfg.get_active_profile(),
+                "profiles": {x.name: x.to_json() for x in cfg.list_profiles()}}
+        Path(p).write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        messagebox.showinfo("Backup", f"Saved to:\n{p}")
 
-    def _restore_config(self) -> None:
-        """Import profiles from a backup JSON file."""
-        path = filedialog.askopenfilename(
-            title="Restore Config",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except Exception as e:
-            messagebox.showerror("Restore Failed", f"Cannot read file:\n{e}")
-            return
-
-        profiles_data = data.get("profiles", {})
-        if not profiles_data:
-            messagebox.showwarning("Restore", "No profiles found in backup file.")
-            return
-
-        count = 0
-        skipped = 0
-        for name, pdata in profiles_data.items():
+    def restore_config(self):
+        p = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if not p: return
+        data = json.loads(Path(p).read_text())
+        profiles = data.get("profiles", {})
+        count, skip = 0, 0
+        for name, pd in profiles.items():
             if cfg.profile_exists(name):
-                if not messagebox.askyesno("Restore", f"Profile '{name}' already exists. Overwrite?"):
-                    skipped += 1
-                    continue
+                if not messagebox.askyesno("Restore", f"'{name}' exists. Overwrite?"):
+                    skip += 1; continue
             cfg.save_profile(cfg.Profile(
-                name=name,
-                type=pdata.get("type", ""),
-                url=pdata.get("url", ""),
-                key=pdata.get("key", ""),
-                model=pdata.get("model", ""),
-                big_model=pdata.get("big_model", ""),
-                middle_model=pdata.get("middle_model", ""),
-                small_model=pdata.get("small_model", ""),
-            ))
-            count += 1
-
-        # Optionally restore active profile
-        active = data.get("active_profile")
-        if active and active in profiles_data:
-            if messagebox.askyesno("Restore", f"Set '{active}' as active profile?"):
-                cfg.set_active_profile(active)
-
+                name=name, type=pd.get("type", ""), url=pd.get("url", ""),
+                key=pd.get("key", ""), model=pd.get("model", ""),
+                big_model=pd.get("big_model", ""),
+                middle_model=pd.get("middle_model", ""),
+                small_model=pd.get("small_model", ""),
+            )); count += 1
+        if data.get("active") in profiles:
+            cfg.set_active_profile(data["active"])
         self._async_refresh_all()
-        messagebox.showinfo("Restore", f"Restored {count} profiles. (Skipped: {skipped})")
-        self.status_label.configure(text=f"✓ Restored {count} profiles from {os.path.basename(path)}")
+        messagebox.showinfo("Restore", f"Restored {count} profiles.")
 
-    # ═══════ Helpers ═══════
+    # ── Misc ──
 
-    @staticmethod
-    def _set_text(widget: tk.Text, text: str) -> None:
-        widget.configure(state=tk.NORMAL)
-        widget.delete("1.0", tk.END)
-        widget.insert("1.0", text)
-        widget.configure(state=tk.DISABLED)
-
-    def _show_about(self) -> None:
-        messagebox.showinfo("About", "GenAI Stack v7.0.0\n\n"
-                            "Multi-mode AI backend proxy management.\n"
-                            "Anthropic | GenAI JWT | GenAI API key")
-
-    def _on_close(self) -> None:
-        if self._refresh_id:
-            self.after_cancel(self._refresh_id)
+    def _close(self):
+        if self._rid: self.after_cancel(self._rid)
         self.destroy()
 
 
-# ────────────────────────────────────
+# ─────────────────────────────────────
 # Profile Dialog
-# ────────────────────────────────────
+# ─────────────────────────────────────
 
 class ProfileDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Tk, title: str = "Profile",
-                 edit_profile: cfg.Profile | None = None) -> None:
+    def __init__(self, parent, title="New Profile", edit_profile=None):
         super().__init__(parent)
-        self.title(title)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-        self.result: cfg.Profile | None = None
+        self.title(title); self.resizable(False, False)
+        self.transient(parent); self.grab_set()
+        self.result = None
         self._editing = edit_profile is not None
+        self.configure(bg=C_BG)
 
-        f = ttk.Frame(self, padding=16)
-        f.pack(fill=tk.BOTH)
+        f = ttk.Frame(self)
+        f.pack(fill=tk.BOTH, padx=20, pady=20)
 
-        ttk.Label(f, text="Name:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.name_var = tk.StringVar()
-        self.name_entry = ttk.Entry(f, textvariable=self.name_var, width=32)
-        self.name_entry.grid(row=0, column=1, sticky=tk.EW, pady=2)
+        ttk.Label(f, text="Profile Name", font=FONT_BOLD).grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
+        self._name = tk.StringVar()
+        e = ttk.Entry(f, textvariable=self._name, font=FONT, width=34)
+        e.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
         if self._editing:
-            self.name_entry.configure(state=tk.DISABLED)
+            e.configure(state=tk.DISABLED)
 
-        ttk.Label(f, text="Type:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.type_var = tk.StringVar(value="genai")
-        cb = ttk.Combobox(f, textvariable=self.type_var, state="readonly",
+        ttk.Label(f, text="Type", font=FONT_BOLD).grid(row=2, column=0, sticky=tk.W, pady=(0, 2))
+        self._type = tk.StringVar(value="genai")
+        cb = ttk.Combobox(f, textvariable=self._type, state="readonly", font=FONT,
                           values=["anthropic", "genai", "genai-api", "openai"])
-        cb.grid(row=1, column=1, sticky=tk.EW, pady=2)
-        cb.bind("<<ComboboxSelected>>", self._on_type_change)
-        if self._editing:
-            cb.configure(state=tk.DISABLED)
+        cb.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
+        cb.bind("<<ComboboxSelected>>", self._type_changed)
+        if self._editing: cb.configure(state=tk.DISABLED)
 
-        ttk.Label(f, text="URL:").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.url_var = tk.StringVar()
-        self.url_entry = ttk.Entry(f, textvariable=self.url_var, width=42)
-        self.url_entry.grid(row=2, column=1, sticky=tk.EW, pady=2)
+        ttk.Label(f, text="API URL", font=FONT_BOLD).grid(row=4, column=0, sticky=tk.W, pady=(0, 2))
+        self._url = tk.StringVar()
+        self._url_e = ttk.Entry(f, textvariable=self._url, font=FONT, width=46)
+        self._url_e.grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
-        ttk.Label(f, text="Key / Token:").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.key_var = tk.StringVar()
-        self.key_entry = ttk.Entry(f, textvariable=self.key_var, width=42)
-        self.key_entry.grid(row=3, column=1, sticky=tk.EW, pady=2)
+        ttk.Label(f, text="Key / Token", font=FONT_BOLD).grid(row=6, column=0, sticky=tk.W, pady=(0, 2))
+        self._key = tk.StringVar()
+        self._key_e = ttk.Entry(f, textvariable=self._key, font=FONT, width=46)
+        self._key_e.grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
-        ttk.Label(f, text="Big Model:").grid(row=4, column=0, sticky=tk.W, pady=2)
-        self.big_var = tk.StringVar(value="GPT-5.5")
-        self.big_entry = ttk.Entry(f, textvariable=self.big_var, width=32)
-        self.big_entry.grid(row=4, column=1, sticky=tk.EW, pady=2)
-
-        ttk.Label(f, text="Middle Model:").grid(row=5, column=0, sticky=tk.W, pady=2)
-        self.mid_var = tk.StringVar()
-        self.mid_entry = ttk.Entry(f, textvariable=self.mid_var, width=32)
-        self.mid_entry.grid(row=5, column=1, sticky=tk.EW, pady=2)
-
-        ttk.Label(f, text="Small Model:").grid(row=6, column=0, sticky=tk.W, pady=2)
-        self.small_var = tk.StringVar()
-        self.small_entry = ttk.Entry(f, textvariable=self.small_var, width=32)
-        self.small_entry.grid(row=6, column=1, sticky=tk.EW, pady=2)
+        ttk.Label(f, text="Models", font=FONT_BOLD).grid(row=8, column=0, sticky=tk.W, pady=(0, 4))
+        mf = ttk.Frame(f)
+        mf.grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
+        self._big = tk.StringVar(value="GPT-5.5")
+        self._mid = tk.StringVar()
+        self._small = tk.StringVar()
+        for i, (label, var) in enumerate([("Big", self._big), ("Mid", self._mid), ("Small", self._small)]):
+            ttk.Label(mf, text=label, font=FONT_SM).grid(row=0, column=i, padx=(0 if i == 0 else 8, 0))
+            self._be = ttk.Entry(mf, textvariable=var, font=FONT, width=14)
+            self._be.grid(row=1, column=i, padx=(0 if i == 0 else 8, 0))
+            setattr(self, f"_m{i}", self._be)
 
         bf = ttk.Frame(f)
-        bf.grid(row=7, column=0, columnspan=2, pady=(12, 0))
-        ttk.Button(bf, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
+        bf.grid(row=10, column=0, columnspan=2, pady=(6, 0))
+        ttk.Button(bf, text="OK", style="Primary.TButton",
+                   command=self._ok).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
 
         if edit_profile:
             self._load(edit_profile)
-        self._on_type_change()
+        self._type_changed()
         self._center(parent)
 
-    def _on_type_change(self, e=None) -> None:
-        needs_url = self.type_var.get() in ("anthropic", "genai-api", "openai")
-        self.url_entry.configure(state=tk.NORMAL if needs_url else tk.DISABLED)
-        needs_models = self.type_var.get() != "anthropic"
-        st = tk.NORMAL if needs_models else tk.DISABLED
-        self.big_entry.configure(state=st)
-        self.mid_entry.configure(state=st)
-        self.small_entry.configure(state=st)
+    def _type_changed(self, e=None):
+        needs_url = self._type.get() in ("anthropic", "genai-api", "openai")
+        self._url_e.configure(state=tk.NORMAL if needs_url else tk.DISABLED)
+        needs_m = self._type.get() != "anthropic"
+        st = tk.NORMAL if needs_m else tk.DISABLED
+        for i in range(3):
+            getattr(self, f"_m{i}").configure(state=st)
 
-    def _load(self, p: cfg.Profile) -> None:
-        self.name_var.set(p.name)
-        self.type_var.set(p.type)
-        self.url_var.set(p.url)
-        self.key_var.set(p.key)
-        self.big_var.set(p.big_model)
-        self.mid_var.set(p.middle_model)
-        self.small_var.set(p.small_model)
+    def _load(self, p):
+        self._name.set(p.name); self._type.set(p.type)
+        self._url.set(p.url); self._key.set(p.key)
+        self._big.set(p.big_model); self._mid.set(p.middle_model)
+        self._small.set(p.small_model)
 
-    def _on_ok(self) -> None:
-        name = self.name_var.get().strip()
-        ptype = self.type_var.get().strip()
-        if not name:
-            messagebox.showwarning("Validation", "Name required.", parent=self); return
+    def _ok(self):
+        name = self._name.get().strip()
+        if not name: messagebox.showwarning("Validation", "Name required."); return
         if not self._editing and cfg.profile_exists(name):
-            messagebox.showwarning("Validation", f"'{name}' exists.", parent=self); return
-        big = self.big_var.get().strip()
-        mid = self.mid_var.get().strip() or big
-        small = self.small_var.get().strip() or big
+            messagebox.showwarning("Validation", f"'{name}' exists."); return
+        ptype = self._type.get().strip()
+        big = self._big.get().strip()
+        mid = self._mid.get().strip() or big
+        small = self._small.get().strip() or big
         if ptype == "anthropic":
-            self.result = cfg.Profile(name=name, type=ptype, url=self.url_var.get().strip(),
-                                      key=self.key_var.get().strip(), model=big or "opus")
+            self.result = cfg.Profile(name=name, type=ptype, url=self._url.get().strip(),
+                                      key=self._key.get().strip(), model=big or "opus")
         else:
-            self.result = cfg.Profile(name=name, type=ptype, url=self.url_var.get().strip(),
-                                      key=self.key_var.get().strip(),
+            self.result = cfg.Profile(name=name, type=ptype, url=self._url.get().strip(),
+                                      key=self._key.get().strip(),
                                       big_model=big, middle_model=mid, small_model=small)
         self.destroy()
 
-    def _center(self, parent: tk.Tk) -> None:
+    def _center(self, p):
         self.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph, px, py = p.winfo_width(), p.winfo_height(), p.winfo_rootx(), p.winfo_rooty()
         w, h = self.winfo_width(), self.winfo_height()
         self.geometry(f"+{px+(pw-w)//2}+{py+(ph-h)//2}")
 
 
-# ────────────────────────────────────
+# ─────────────────────────────────────
 # Token Dialog
-# ────────────────────────────────────
+# ─────────────────────────────────────
 
 class TokenDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Tk, title: str = "Update Token",
-                 current_token: str = "") -> None:
+    def __init__(self, parent, title="Update Token", current=""):
         super().__init__(parent)
-        self.title(title)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-        self.result: str | None = None
+        self.title(title); self.resizable(False, False)
+        self.transient(parent); self.grab_set()
+        self.result = None
+        self.configure(bg=C_BG)
 
-        f = ttk.Frame(self, padding=16)
-        f.pack(fill=tk.BOTH)
-        ttk.Label(f, text="New Token:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.token_var = tk.StringVar(value=current_token)
-        self.token_entry = ttk.Entry(f, textvariable=self.token_var, width=50)
-        self.token_entry.grid(row=0, column=1, sticky=tk.EW, pady=4, padx=(8, 0))
-        ttk.Label(f, text="JWT (eyJ...) or student_id@password",
-                  font=("Segoe UI", 8) if IS_WINDOWS else ("sans-serif", 8),
-                 ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        f = ttk.Frame(self)
+        f.pack(fill=tk.BOTH, padx=20, pady=20)
+
+        ttk.Label(f, text="New Token / Key", font=FONT_BOLD).pack(anchor=tk.W, pady=(0, 4))
+        self._v = tk.StringVar(value=current)
+        ttk.Entry(f, textvariable=self._v, font=FONT, width=50).pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(f, text="JWT (eyJ…) or student_id@password", style="Subtitle.TLabel",
+                  font=FONT_SM).pack(anchor=tk.W, pady=(0, 12))
+
         bf = ttk.Frame(f)
-        bf.grid(row=2, column=0, columnspan=2)
-        ttk.Button(bf, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
+        bf.pack()
+        ttk.Button(bf, text="OK", style="Primary.TButton",
+                   command=self._ok).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
+
         self._center(parent)
-        self.token_entry.focus_set()
 
-    def _on_ok(self) -> None:
-        token = self.token_var.get().strip()
-        if not token: messagebox.showwarning("Validation", "Token empty.", parent=self); return
-        self.result = token
-        self.destroy()
+    def _ok(self):
+        t = self._v.get().strip()
+        if not t: messagebox.showwarning("Validation", "Empty."); return
+        self.result = t; self.destroy()
 
-    def _center(self, parent: tk.Tk) -> None:
+    def _center(self, p):
         self.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph, px, py = p.winfo_width(), p.winfo_height(), p.winfo_rootx(), p.winfo_rooty()
         w, h = self.winfo_width(), self.winfo_height()
         self.geometry(f"+{px+(pw-w)//2}+{py+(ph-h)//2}")
 
 
-def main() -> None:
-    app = GenAIStackGUI()
-    app.mainloop()
+def main():
+    GenAIStackGUI().mainloop()
 
 
 if __name__ == "__main__":
