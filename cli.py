@@ -576,6 +576,12 @@ def cmd_menu() -> None:
     main()
 
 
+def cmd_gui() -> None:
+    """启动 Windows 原生 GUI 控制面板。"""
+    from gui import main
+    main()
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════
@@ -666,6 +672,9 @@ def build_parser() -> argparse.ArgumentParser:
     # menu
     sub.add_parser("menu", help="启动 TUI 交互控制面板")
 
+    # gui
+    sub.add_parser("gui", help="启动 Windows 原生 GUI 控制面板")
+
     return parser
 
 
@@ -714,6 +723,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_fix()
     elif cmd == "menu":
         cmd_menu()
+    elif cmd == "gui":
+        cmd_gui()
     else:
         print(f"{red(f'未知命令: {cmd}')}")
         return 1

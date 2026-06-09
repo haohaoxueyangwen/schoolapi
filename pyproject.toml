@@ -1,7 +1,7 @@
 [project]
 name = "genai-stack"
-version = "6.0.0"
-description = "GenAI Stack TUI - 统一控制面板，管理多种 AI 后端代理"
+version = "7.0.0"
+description = "GenAI Stack - 多模式 AI 后端代理管理 (TUI + GUI + CLI)"
 requires-python = ">=3.11"
 dependencies = [
     "textual>=2.0.0",
@@ -11,6 +11,7 @@ dependencies = [
 [project.scripts]
 genai-tui = "tui.app:main"
 genai-stack-cli = "cli:main"
+genai-stack-gui = "gui:main"
 
 [dependency-groups]
 dev = []
