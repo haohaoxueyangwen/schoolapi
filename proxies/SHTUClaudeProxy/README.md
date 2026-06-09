@@ -1,0 +1,704 @@
+﻿# SHTUClaudeProxy
+
+GPT系列模型 API Format请使用responses
+
+Current development version: **v1.9.0**
+
+SHTUClaudeProxy is a cross-platform local proxy for connecting **Claude Code** to the ShanghaiTech University campus **GenAI Response API**.
+
+This tool was created by **sunyb, ShanghaiTech University Library and Information Center** for internal campus use. It helps users access Claude Code through the university GenAI API by translating Claude Code's Anthropic Messages API traffic into an OpenAI Responses-style upstream request and converting streaming responses back into Claude Code-compatible Server-Sent Events.
+
+> Note: SHTUClaudeProxy is a local proxy tool created by sunyb for ShanghaiTech campus GenAI API access from Claude Code.
+
+<img width="1278" height="1034" alt="image" src="https://github.com/user-attachments/assets/8287915e-d569-488c-a64f-c3bd5e7a2e81" />
+<img width="1258" height="257" alt="image" src="https://github.com/user-attachments/assets/48f637fc-042d-4738-8ebe-2949a12fe067" />
+<img width="1195" height="449" alt="image" src="https://github.com/user-attachments/assets/7f9ffe47-b5c1-4a66-ab05-1b6c747335c8" />
+<img width="2456" height="1620" alt="5cf20b87c9f360383d6b1c8d2fa02b48" src="https://github.com/user-attachments/assets/602ffb99-90ca-44b0-b302-911641c7dc7e" />
+
+
+## What It Does
+
+Claude Code expects an Anthropic-compatible API endpoint such as:
+
+```text
+POST /v1/messages
+```
+
+ShanghaiTech GenAI Response API returns OpenAI Responses-style streaming events such as:
+
+```text
+event: response.output_text.delta
+```
+
+SHTUClaudeProxy bridges the two formats:
+
+```text
+Claude Code
+  -> Anthropic Messages request
+  -> SHTUClaudeProxy on 127.0.0.1:8082
+  -> GenAI Response API
+  -> OpenAI Responses SSE
+  -> Anthropic-style SSE
+  -> Claude Code
+```
+
+## Features
+
+- Windows GUI release; Linux/macOS can run from source with GUI or CLI mode.
+- Guided quick-start GUI with a one-click `Save + Connect + Launch` path plus manual step buttons.
+- Full-window scrolling for smaller displays.
+- Local Anthropic-compatible endpoint for Claude Code.
+- Multiple model configurations.
+- Per-Claude-role model routing for `ANTHROPIC_MODEL`, Haiku, Sonnet, Opus, and reasoning model variables.
+- Per-model settings:
+  - display name
+  - Claude Code model ID
+  - GenAI Response API base URL
+  - API key
+  - upstream model ID
+  - upstream API format (`responses` or `chat_completions`)
+- One-click writing of Claude Code `settings.json`.
+- One-click Claude Code launch with proxy environment.
+- Auto-detection of npm-installed Claude Code.
+- Portable across Windows, Linux, and macOS user accounts where Python/Tkinter is available.
+- PyInstaller build script for Windows release packaging.
+- Bidirectional tool-call translation for Claude Code `tool_use/tool_result` and upstream `tool_calls/function_call` protocols.
+
+## Intended Audience
+
+This project is intended for ShanghaiTech University users who have access to the campus GenAI Response API and want to use that API from Claude Code.
+
+It is not an official Anthropic product, not an OpenAI product, and not a general-purpose full Anthropic API emulator.
+
+## Important Limitations
+
+This project focuses on text streaming compatibility plus Claude Code tool-call bridging.
+
+Known limitations:
+
+- Tool calls are translated between Anthropic `tool_use/tool_result` and upstream Chat Completions `tool_calls` or Responses `function_call/function_call_output` formats.
+- Token usage fields are approximate.
+- Images are best-effort only.
+- Very complex Claude Code workflows may still need additional edge-case testing against the exact upstream model behavior.
+
+For normal conversational and many coding-assistance workflows, the proxy can be sufficient. For advanced autonomous coding workflows, validate with a small file-read or command-style Claude Code task first.
+
+## Repository Layout
+
+```text
+.
+├── app.py                 # GUI entry point
+├── gui.py                 # Tkinter desktop UI
+├── proxy.py               # Anthropic Messages <-> Responses proxy
+├── cli.py                 # Headless command-line tools
+├── platform_utils.py      # Cross-platform path, script, and launch helpers
+├── config_store.py        # Config loading, defaults, path portability
+├── config.example.json    # Safe example config without API key
+├── build_exe.ps1          # Windows build script
+├── build_exe.bat          # Double-click build helper
+├── build_unix.sh          # Linux/macOS build script
+├── requirements-build.txt # Build-time dependency list
+├── LICENSE
+├── SECURITY.md
+└── CONTRIBUTING.md
+```
+
+## Requirements
+
+### End Users
+
+Use the recommended single-file release:
+
+```text
+SHTUClaudeProxy-v1.6.0-windows-x64.exe
+```
+
+You do **not** need to install Python, pip, PyInstaller, or any Python packages. The single-file EXE bundles the Python runtime and required dependencies.
+
+You still need:
+
+- Windows 10/11 or Windows Server with desktop UI support for the packaged EXE.
+- For Linux/macOS: Python 3.10+ from source; Tkinter/display server for GUI, or CLI mode for headless servers.
+- Claude Code installed through npm or another method.
+- Access to ShanghaiTech GenAI Response API.
+- A valid GenAI Response API key.
+
+### Developers / Building from Source
+
+Developers, Linux/macOS users running from source, or anyone rebuilding packages need:
+
+- Python 3.10+
+- PyInstaller
+
+Install build dependency:
+
+```powershell
+python -m pip install -r requirements-build.txt
+```
+
+## Quick Start for End Users
+
+### 1. Install Claude Code
+
+If Claude Code is installed with npm, the default executable is usually:
+
+```text
+%APPDATA%\npm\claude.cmd
+```
+
+The GUI tries to detect this automatically.
+
+### 2. Start SHTUClaudeProxy
+
+Recommended download for normal users:
+
+```text
+SHTUClaudeProxy-v1.6.0-windows-x64.exe
+```
+
+Double-click it directly. No Python installation is required.
+
+Alternative portable zip package:
+
+```text
+SHTUClaudeProxy-windows-x64.zip
+```
+
+If you use the zip package, extract the whole folder and run `SHTUClaudeProxy.exe` inside it.
+
+### 3. Configure Server Settings
+
+Default values:
+
+```text
+Host: 127.0.0.1
+Port: 8082
+Claude Settings Path: %USERPROFILE%\.claude\settings.json
+Claude Code Path: %APPDATA%\npm\claude.cmd
+```
+
+You can change these if your environment is different.
+
+### 4. Configure a Model
+
+For each model entry:
+
+| Field | Meaning | Example |
+| --- | --- | --- |
+| Display Name | Friendly name shown in the GUI | ShanghaiTech GPT-5.5 |
+| Model ID for Claude Code | Model name Claude Code will request | GPT-5.5 |
+| Base URL | Campus GenAI API endpoint | chat_completions: https://genaiapi.shanghaitech.edu.cn/api/v1/start; responses: https://genaiapi.shanghaitech.edu.cn/api/v1/response |
+| API Key | Your campus API key | keep private |
+| Upstream Model | Model ID sent to GenAI Response API | GPT-5.5 |
+
+Click:
+
+```text
+Apply Model Changes
+Save Config
+```
+
+### 5. Write Claude Code Settings
+
+Click:
+
+```text
+Write Claude Settings
+```
+
+The app updates your Claude Code settings file, usually:
+
+```text
+%USERPROFILE%\.claude\settings.json
+```
+
+Use `Claude Model Routing` to choose which configured Model ID is written to each Claude Code model variable. They may all point to the same model, or each role can point to a different configured model. It writes an `env` block like:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+    "ANTHROPIC_MODEL": "GPT-5.5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "GPT-5.5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "GPT-5.5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "GPT-5.5",
+    "ANTHROPIC_REASONING_MODEL": "GPT-5.5",
+    "ANTHROPIC_AUTH_TOKEN": "local-proxy"
+  },
+  "includeCoAuthoredBy": false
+}
+```
+
+`Current Main Model` shows the value used for `ANTHROPIC_MODEL`. To change it, select a different `Main Model` in `Claude Model Routing`.
+
+`ANTHROPIC_AUTH_TOKEN` is only a local placeholder for Claude Code. The real upstream API key is stored in SHTUClaudeProxy's local app config and is used only by the proxy when forwarding requests to GenAI Response API.
+
+### 6. Start Proxy
+
+Click:
+
+```text
+Start Proxy
+```
+
+Expected status:
+
+```text
+Running on http://127.0.0.1:8082
+```
+
+### 7. Start Claude Code
+
+You can either:
+
+- click `Launch Claude Code` in the GUI, or
+- start Claude Code manually after writing settings.
+
+If starting manually, make sure the proxy is already running.
+
+
+## Chat Completions API Format
+
+SHTUClaudeProxy supports two upstream API formats per model:
+
+| API Format | Upstream endpoint style | Streaming delta parsed from |
+| --- | --- | --- |
+| `responses` | OpenAI Responses-style `/response` | `response.output_text.delta` |
+| `chat_completions` | OpenAI Chat Completions-style `/chat/completions` | `choices[0].delta.content` |
+
+For ShanghaiTech GenAI Chat Completions endpoints, configure a model like this:
+
+```json
+{
+  "name": "ShanghaiTech DeepSeek Pro Chat Completions",
+  "model_id": "deepseek-pro",
+  "base_url": "https://genaiapi.shanghaitech.edu.cn/api/v1/start",
+  "api_key": "YOUR_API_KEY",
+  "upstream_model": "deepseek-pro",
+  "api_format": "chat_completions"
+}
+```
+
+The equivalent upstream request generated by the proxy is compatible with this style:
+
+```bash
+curl -X POST https://genaiapi.shanghaitech.edu.cn/api/v1/start/chat/completions \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -d '{
+    "model": "deepseek-pro",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "who are you"}
+    ],
+    "max_tokens": 4096,
+    "stream": true,
+    "temperature": 0.7
+  }'
+```
+
+In the GUI, `API Format` supports `responses` and `chat_completions`. Selecting `chat_completions` fills Base URL with `https://genaiapi.shanghaitech.edu.cn/api/v1/start`; selecting `responses` fills Base URL with `https://genaiapi.shanghaitech.edu.cn/api/v1/response`.
+
+## Multiple Models
+
+You can add multiple model routes.
+
+Example:
+
+| Model ID for Claude Code | Upstream Model | Base URL |
+| --- | --- | --- |
+| GPT-5.5 | GPT-5.5 | https://genaiapi.shanghaitech.edu.cn/api/v1/start |
+| GPT-5.5-fast | GPT-5.5 | another compatible endpoint |
+| GPT-5.5-reasoning | GPT-5.5 | another compatible endpoint |
+
+Claude Code selects a route by the model ID it sends. The proxy then forwards to the configured upstream `base_url`, `api_key`, and `upstream_model`.
+
+## Configuration Files
+
+### App Config
+
+Stored locally at:
+
+```text
+%APPDATA%\SHTUClaudeProxy\config.json
+```
+
+This file may contain your API key in plaintext. Do not commit it.
+
+### Claude Code Settings
+
+Usually stored at:
+
+```text
+%USERPROFILE%\.claude\settings.json
+```
+
+The GUI writes only the `env` fields needed by Claude Code and preserves other JSON fields when possible.
+
+## Build from Source
+
+Clone the repository and run:
+
+```powershell
+python -m pip install -r requirements-build.txt
+.\build_exe.ps1
+```
+
+Or install PyInstaller automatically:
+
+```powershell
+.\build_exe.ps1 -InstallDeps
+```
+
+Outputs:
+
+```text
+release\SHTUClaudeProxy-v1.6.0-windows-x64.exe
+release\SHTUClaudeProxy-windows-x64.zip
+dist\SHTUClaudeProxy\SHTUClaudeProxy.exe
+```
+
+Use `release\SHTUClaudeProxy-v1.6.0-windows-x64.exe` for normal users. It is a single-file executable and does not require Python or the `_internal` folder.
+
+Use `release\SHTUClaudeProxy-windows-x64.zip` as the Windows portable folder package. If you distribute the zip package, users must extract the whole folder because the `_internal` runtime folder is required by the folder build.
+
+For Linux/macOS packaging from source, run:
+
+```bash
+./build_unix.sh
+```
+
+This generates a platform-specific single-file binary and a `.tar.gz` folder package under `release/`.
+
+## Version v1.9.0
+
+v1.9.0 adds real Claude Code tool-call bridging:
+
+- Converts Claude Code `tools` into upstream Chat Completions `tools` or Responses `tools`.
+- Converts assistant `tool_use` history into Chat Completions `tool_calls` or Responses `function_call` items.
+- Converts Claude Code `tool_result` messages into Chat Completions `tool` messages or Responses `function_call_output` items.
+- Converts upstream streamed `tool_calls` / `function_call` events back into Anthropic-style `tool_use` content blocks.
+- Returns `stop_reason: tool_use` when the upstream model requests tool execution.
+
+## Version v1.8.0
+
+v1.8.0 updates the default upstream configuration and GUI labels:
+
+- Renames `Responses Base URL` to `Base URL` in the GUI.
+- Changes the default API Format to `chat_completions`.
+- Uses `https://genaiapi.shanghaitech.edu.cn/api/v1/start` as the default Base URL for `chat_completions`.
+- Automatically switches Base URL to `https://genaiapi.shanghaitech.edu.cn/api/v1/response` when API Format is `responses`.
+- Adds clearer GUI hint text for the two API Format options.
+## Version v1.7.0
+
+v1.7.0 adds Linux/macOS source-based support while keeping the Windows v1.6.0 release package unchanged. It includes:
+
+- Linux/macOS GUI support from source with Tkinter.
+- Headless CLI mode for servers without a display.
+- X11 forwarding guidance for remote Linux GUI use.
+- Cross-platform Claude path, settings path, launch script, and launch helpers.
+- A Linux/macOS smoke test script.
+- A source zip package that extracts into its own directory.
+- English-only GUI text to avoid Linux font fallback issues.
+## Version v1.6.0
+
+v1.6.0 is the zero-install release. It includes:
+
+- A one-click setup path: save config, write Claude settings, start the proxy, then launch Claude Code.
+- Per-role Claude model routing for main, Haiku, Sonnet, Opus, and reasoning model variables.
+- A visible `Effective` routing summary so users can see which model is currently active.
+- Support for both OpenAI Responses-style and Chat Completions-style upstream endpoints.
+- Better upstream URL normalization and error reporting.
+- A larger scrollable UI for smaller displays.
+- A single-file Windows EXE release that does not require Python installation or a sidecar `_internal` folder.
+
+
+## Linux and macOS Usage
+
+Windows users should normally download the single-file EXE from the Release page. Linux and macOS support is source-based at this stage.
+
+### 1. Unpack the Source Package
+
+The Linux/macOS source package should unpack into its own directory:
+
+```bash
+unzip SHTUClaudeProxy-v1.8.0-source-linux-macos.zip
+cd SHTUClaudeProxy-v1.8.0-source-linux-macos
+```
+
+Run the smoke test first:
+
+```bash
+python3 -m py_compile app.py cli.py config_store.py gui.py platform_utils.py proxy.py smoke_test.py
+python3 smoke_test.py
+```
+
+Expected output:
+
+```text
+SHTUClaudeProxy smoke test passed
+```
+
+### 2. Configure API Key and Model
+
+Start once to generate `config.json`, or copy from `config.example.json`:
+
+```bash
+python3 cli.py show-config
+cp config.example.json config.json
+```
+
+Edit `config.json` with your editor:
+
+```bash
+nano config.json
+```
+
+At minimum, fill these fields in the model you want to use:
+
+```json
+{
+  "model_id": "GPT-5.5",
+  "base_url": "https://genaiapi.shanghaitech.edu.cn/api/v1/response",
+  "api_key": "PASTE_YOUR_GENAI_API_KEY_HERE",
+  "upstream_model": "GPT-5.5",
+  "api_format": "responses"
+}
+```
+
+Important fields:
+
+- `model_id`: the model name Claude Code will request.
+- `base_url`: the upstream GenAI API endpoint.
+- `api_key`: your GenAI API key. Keep it private.
+- `upstream_model`: the actual upstream model name sent to GenAI API.
+- `api_format`: use `responses` or `chat_completions`.
+
+For Chat Completions-compatible upstreams, use:
+
+```json
+"api_format": "chat_completions"
+```
+
+Model routing is controlled by `model_env`:
+
+```json
+"model_env": {
+  "ANTHROPIC_MODEL": "GPT-5.5",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL": "GPT-5.5",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL": "GPT-5.5",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL": "GPT-5.5",
+  "ANTHROPIC_REASONING_MODEL": "GPT-5.5"
+}
+```
+
+Each value must match one configured `model_id`. They can all be the same, or you can route different Claude roles to different configured models.
+
+### 3. GUI Mode
+
+Run the Tkinter GUI from source:
+
+```bash
+python3 app.py
+```
+
+On Linux servers without a local desktop, use X11 forwarding:
+
+```bash
+ssh -X user@host
+cd SHTUClaudeProxy-v1.8.0-source-linux-macos
+python3 app.py
+```
+
+If Tkinter is missing on Linux, install the system package for your distribution, for example:
+
+```bash
+sudo apt install python3-tk
+```
+
+### 4. Headless CLI Mode
+
+For Linux servers without GUI or X11 forwarding, use CLI mode.
+
+Check resolved config:
+
+```bash
+python3 cli.py show-config
+```
+
+Write Claude Code settings:
+
+```bash
+python3 cli.py write-settings
+```
+
+This updates:
+
+```text
+~/.claude/settings.json
+```
+
+Install a helper launch script:
+
+```bash
+python3 cli.py install-launch-script
+```
+
+This creates:
+
+```text
+~/shtu-claude-proxy/claude-shtu.sh
+```
+
+Start the proxy in one terminal:
+
+```bash
+python3 cli.py serve
+```
+
+In another terminal, launch Claude Code through the helper script:
+
+```bash
+~/shtu-claude-proxy/claude-shtu.sh
+```
+
+Alternatively, print environment variables and apply them manually:
+
+```bash
+python3 cli.py print-env
+```
+
+Then run `claude` in the same shell after exporting those variables.
+
+## Run from Source
+
+```powershell
+python .\gui.py
+```
+
+Run proxy only:
+
+```powershell
+python .\proxy.py --host 127.0.0.1 --port 8082
+```
+
+## Direct API Smoke Test
+
+After starting the proxy:
+
+```powershell
+$body = @{
+  model = "GPT-5.5"
+  max_tokens = 100
+  stream = $true
+  messages = @(@{ role = "user"; content = "hi" })
+} | ConvertTo-Json -Depth 10
+
+Invoke-WebRequest -UseBasicParsing `
+  -Uri http://127.0.0.1:8082/v1/messages?beta=true `
+  -Method POST `
+  -ContentType "application/json" `
+  -Headers @{ "anthropic-version" = "2023-06-01"; "x-api-key" = "local-proxy" } `
+  -Body $body
+```
+
+Expected SSE events include:
+
+```text
+event: message_start
+event: content_block_start
+event: content_block_delta
+event: message_delta
+event: message_stop
+```
+
+## Troubleshooting
+
+### Claude Code: `ConnectionRefused`
+
+Cause: Claude Code is pointing to `http://127.0.0.1:8082`, but the local proxy is not running.
+
+Fix:
+
+1. Open SHTUClaudeProxy.
+2. Click `Start Proxy`.
+3. Confirm status shows `Running on http://127.0.0.1:8082`.
+4. Restart Claude Code.
+
+### Claude Code Still Uses an Old Port
+
+Check:
+
+```text
+%USERPROFILE%\.claude\settings.json
+```
+
+Make sure `ANTHROPIC_BASE_URL` is:
+
+```text
+http://127.0.0.1:8082
+```
+
+If not, click `Write Claude Settings` again.
+
+### Claude Code Says Model Does Not Exist
+
+Usually this means the proxy returned an error before reaching upstream.
+
+Check:
+
+- model ID in Claude Code matches `Model ID for Claude Code`
+- API key is configured
+- upstream model is valid for GenAI Response API
+- proxy logs in the GUI
+
+### Response Hangs After First Message
+
+Use the latest version. Older builds used keep-alive SSE behavior that could cause Claude Code to wait for the connection to close.
+
+### API Key Safety
+
+Never paste your API key into GitHub issues. The API key is stored locally in:
+
+```text
+%APPDATA%\SHTUClaudeProxy\config.json
+```
+
+## Publishing Checklist
+
+Before publishing or creating a release, make sure you do not commit:
+
+```text
+config.json
+build/
+dist/
+*.spec
+__pycache__/
+%APPDATA%\SHTUClaudeProxy\config.json
+%USERPROFILE%\.claude\settings.json
+```
+
+Run a quick scan for keys before pushing.
+
+## Credits
+
+Created by **sunyb**, ShanghaiTech University Library and Information Center.
+
+Purpose: provide a convenient local bridge for ShanghaiTech campus GenAI Response API access from Claude Code.
+
+## License
+
+MIT License. See `LICENSE`.
+
+
+
+
+
+
+
+
+
+
+
+

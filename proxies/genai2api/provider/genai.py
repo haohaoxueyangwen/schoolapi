@@ -1,0 +1,428 @@
+import json
+import logging
+import re
+import time
+import uuid
+from datetime import datetime
+
+import requests
+
+from config import GENAI_URL, build_genai_headers, model_registry
+from context_compress import check_context_size
+from errors import make_error_chunk
+from genai_types import new_chat_group_id
+from tools.parsing import extract_tool_calls, _tag_prefix_len
+from tools.prompts import flatten_message_content, normalize_message_content
+
+logger = logging.getLogger(__name__)
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]")
+
+# Token expiration keywords from GenAI backend business errors
+_TOKEN_EXPIRED_KEYWORDS = ("Token\u5931\u6548", "token\u5931\u6548", "token expired", "\u8bf7\u91cd\u65b0\u767b\u5f55", "\u672a\u767b\u5f55")
+
+
+def _is_token_expired_error(err_msg: str) -> bool:
+    """Check if an error message indicates token expiration."""
+    return any(kw in err_msg for kw in _TOKEN_EXPIRED_KEYWORDS)
+
+
+def convert_messages_to_genai_format(messages):
+    chat_info = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            chat_info = flatten_message_content(msg.get("content", ""))
+            break
+    return chat_info
+
+
+def extract_content_from_genai(response_data):
+    try:
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            delta = response_data["choices"][0].get("delta", {})
+            content = delta.get("content") or None
+            reasoning = delta.get("reasoning_content") or None
+            return content, reasoning
+    except (KeyError, IndexError, TypeError):
+        pass
+    return None, None
+
+
+def estimate_text_tokens(text):
+    if not text:
+        return 0
+    return len(TOKEN_PATTERN.findall(text))
+
+
+def log_stream_metrics(model, started_at, first_token_at, content_text, reasoning_text):
+    total_elapsed = max(time.monotonic() - started_at, 1e-6)
+    content_tokens = estimate_text_tokens(content_text)
+    reasoning_tokens = estimate_text_tokens(reasoning_text)
+    total_tokens = content_tokens + reasoning_tokens
+
+    extra = ""
+    if first_token_at is not None:
+        ttft_ms = (first_token_at - started_at) * 1000
+        extra = f" ttft_ms={ttft_ms:.0f}"
+
+    logger.info(
+        "stream metrics model=%s est_tokens=%d content_est=%d reasoning_est=%d toks_per_s=%.2f%s",
+        model,
+        total_tokens,
+        content_tokens,
+        reasoning_tokens,
+        total_tokens / total_elapsed,
+        extra,
+    )
+
+
+def stream_genai_response(chat_info, messages, model, max_tokens, config):
+    started_at = time.monotonic()
+    first_token_at = None
+    content_parts = []
+    reasoning_parts = []
+    token = config.token_manager.get_token()
+    root_ai_type = model_registry.get_root_ai_type(model, token, _config=config)
+    headers = build_genai_headers(token)
+    normalized_messages = [normalize_message_content(msg) for msg in messages]
+    needs_compact = check_context_size(normalized_messages)
+
+    chat_group_id = new_chat_group_id()
+
+    prompt_tokens = max(1, len(chat_info) // 4) if chat_info else 0
+
+    genai_data = {
+        "chatInfo": chat_info or "hello",
+        "messages": normalized_messages,
+        "type": "3",
+        "stream": True,
+        "chatGroupId": chat_group_id,
+        "aiType": model,
+        "aiSecType": "1",
+        "promptTokens": prompt_tokens,
+        "rootAiType": root_ai_type,
+        "maxToken": max_tokens or 30000
+    }
+
+    logger.debug("=== GenAI Request ===")
+    logger.debug("Model: %s, rootAiType: %s", model, root_ai_type)
+    logger.debug("Messages count: %d", len(normalized_messages))
+    for i, msg in enumerate(normalized_messages):
+        role = msg.get('role', '?')
+        content = flatten_message_content(msg.get('content', ''))
+        preview = (content[:200] + '...') if content and len(content) > 200 else content
+        logger.debug("  [%d] role=%s, content=%s", i, role, preview)
+
+    max_retries = 3
+    retry_delay = 2.0
+
+    try:
+        for attempt in range(1, max_retries + 1):
+            if attempt > 1:
+                logger.info("Retry attempt %d/%d for model=%s", attempt, max_retries, model)
+                time.sleep(retry_delay)
+                token = config.token_manager.get_token()
+                headers = build_genai_headers(token)
+                content_parts.clear()
+                reasoning_parts.clear()
+                first_token_at = None
+                started_at = time.monotonic()
+
+            try:
+                response = requests.post(
+                    GENAI_URL, headers=headers, json=genai_data,
+                    stream=True, timeout=60
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+                logger.warning("Network error (attempt %d): %s", attempt, net_err)
+                if attempt < max_retries:
+                    continue
+                yield make_error_chunk(f"Network error: {net_err}", model)
+                return
+
+            logger.debug("GenAI Response Status: %d", response.status_code)
+
+            if response.status_code == 401:
+                new_token = config.token_manager.force_refresh()
+                if new_token:
+                    logger.info("Token refreshed after 401, retrying request")
+                    token = new_token
+                    headers = build_genai_headers(new_token)
+                    response = requests.post(
+                        GENAI_URL, headers=headers, json=genai_data,
+                        stream=True, timeout=60
+                    )
+
+            if response.status_code != 200:
+                err_text = response.text[:500]
+                logger.warning("GenAI API error %d: %s", response.status_code, err_text)
+                is_quota = '额度' in err_text or 'quota' in err_text.lower()
+                if is_quota and attempt < max_retries:
+                    continue
+                if response.status_code == 401:
+                    yield make_error_chunk("Upstream authentication failed", model)
+                elif response.status_code == 429:
+                    yield make_error_chunk("Upstream rate limit exceeded", model)
+                else:
+                    yield make_error_chunk(f"Upstream API error: {response.status_code}", model)
+                return
+
+            finished = False
+            emitted_done = False
+            got_content = False
+            quota_error_in_stream = False
+            line_count = 0
+
+            for line in response.iter_lines():
+                if finished:
+                    break
+
+                if line:
+                    try:
+                        line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+
+                        if line_count < 5:
+                            logger.debug("Raw line [%d]: %s", line_count, line_str[:300])
+                        line_count += 1
+
+                        if line_str.startswith('data:'):
+                            line_str = line_str[5:].strip()
+
+                        if line_str:
+                            genai_json = json.loads(line_str)
+
+                            if isinstance(genai_json, dict) and genai_json.get("success") is False:
+                                err_msg = genai_json.get("message", "Unknown upstream error")
+                                err_code = genai_json.get("code", 500)
+                                logger.warning("GenAI business error (code=%s): %s", err_code, err_msg)
+                                if '额度' in err_msg and attempt < max_retries:
+                                    quota_error_in_stream = True
+                                    break
+                                if _is_token_expired_error(err_msg) and attempt < max_retries:
+                                    logger.warning("Token expired, will refresh and retry (attempt %d)", attempt)
+                                    config.token_manager.force_refresh()
+                                    quota_error_in_stream = True
+                                    break
+                                yield make_error_chunk(f"Upstream error: {err_msg}", model)
+                                return
+
+                            if isinstance(genai_json, dict) and genai_json.get("code") in (500, 400, 403, 404):
+                                err_msg = genai_json.get("errMsg") or genai_json.get("message") or "Unknown upstream error"
+                                logger.warning("GenAI error (code=%s): %s", genai_json.get("code"), err_msg)
+                                if '额度' in err_msg and attempt < max_retries:
+                                    quota_error_in_stream = True
+                                    break
+                                if _is_token_expired_error(err_msg) and attempt < max_retries:
+                                    logger.warning("Token expired (code=%s), will refresh and retry (attempt %d)",
+                                                   genai_json.get("code"), attempt)
+                                    config.token_manager.force_refresh()
+                                    quota_error_in_stream = True
+                                    break
+                                yield make_error_chunk(f"Upstream error: {err_msg}", model)
+                                return
+
+                            if "choices" in genai_json and len(genai_json["choices"]) > 0:
+                                choice = genai_json["choices"][0]
+                                if choice.get("finish_reason") is not None:
+                                    finished = True
+
+                            if finished:
+                                log_stream_metrics(
+                                    model, started_at, first_token_at,
+                                    "".join(content_parts), "".join(reasoning_parts),
+                                )
+                                final_response = {
+                                    "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(datetime.now().timestamp()),
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                                }
+                                emitted_done = True
+                                yield f"data: {json.dumps(final_response)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                break
+
+                            content, reasoning = extract_content_from_genai(genai_json)
+
+                            delta = {}
+                            if content:
+                                delta["content"] = content
+                                got_content = True
+                            if reasoning:
+                                delta["reasoning_content"] = reasoning
+                                got_content = True
+
+                            if delta:
+                                if first_token_at is None:
+                                    first_token_at = time.monotonic()
+                                if content:
+                                    content_parts.append(content)
+                                if reasoning:
+                                    reasoning_parts.append(reasoning)
+                                openai_response = {
+                                    "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(datetime.now().timestamp()),
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(openai_response)}\n\n"
+
+                    except json.JSONDecodeError as e:
+                        logger.debug("JSON decode error: %s, line: %s", e, line_str[:200])
+
+            logger.debug("Total lines received: %d, finished: %s", line_count, finished)
+
+            if emitted_done:
+                return
+
+            if quota_error_in_stream and attempt < max_retries:
+                continue
+            if not got_content and not finished and attempt < max_retries:
+                logger.warning("Empty response (attempt %d), retrying", attempt)
+                continue
+
+            break
+
+        log_stream_metrics(
+            model, started_at, first_token_at,
+            "".join(content_parts), "".join(reasoning_parts),
+        )
+        final_response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion.chunk",
+            "created": int(datetime.now().timestamp()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }
+        yield f"data: {json.dumps(final_response)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        logger.exception("Error in stream_genai_response")
+        yield make_error_chunk(str(e), model)
+
+
+def stream_genai_response_with_tools(chat_info, messages, model, max_tokens, config, allowed_tool_names=None):
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(datetime.now().timestamp())
+
+    OPEN_TAG = "<tool_call"
+
+    buffer = ""
+    tool_buffer = ""
+    sent_role = False
+    tool_detected = False
+
+    def make_chunk(delta, finish_reason=None):
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        }
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    def emit_text(text):
+        nonlocal sent_role
+        delta = {"content": text}
+        if not sent_role:
+            delta["role"] = "assistant"
+            sent_role = True
+        return make_chunk(delta)
+
+    for line in stream_genai_response(chat_info, messages, model, max_tokens, config):
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:].strip()
+        if data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        if "choices" not in data or not data["choices"]:
+            continue
+        chunk_delta = data["choices"][0].get("delta", {})
+        content = chunk_delta.get("content", "")
+        if not content:
+            continue
+
+        if tool_detected:
+            tool_buffer += content
+            continue
+
+        buffer += content
+
+        tag_pos = buffer.find(OPEN_TAG)
+        if tag_pos >= 0:
+            pre = buffer[:tag_pos]
+            if pre.strip():
+                yield emit_text(pre)
+
+            tool_detected = True
+            tool_buffer = buffer[tag_pos:]
+            buffer = ""
+            continue
+
+        plen = _tag_prefix_len(buffer, OPEN_TAG)
+        if plen > 0:
+            safe = buffer[:-plen]
+            if safe:
+                yield emit_text(safe)
+            buffer = buffer[-plen:]
+        else:
+            if buffer:
+                yield emit_text(buffer)
+            buffer = ""
+
+    if tool_detected:
+        tool_calls, remaining = extract_tool_calls(
+            tool_buffer,
+            allowed_tool_names=allowed_tool_names,
+        )
+
+        if tool_calls:
+            logger.debug("Streaming tool calling: detected %d tool_call(s)", len(tool_calls))
+
+            if remaining and remaining.strip():
+                yield emit_text(remaining.strip())
+
+            if not sent_role:
+                yield make_chunk({"role": "assistant"})
+                sent_role = True
+
+            for i, tc in enumerate(tool_calls):
+                yield make_chunk({
+                    "tool_calls": [{
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"]
+                        }
+                    }]
+                })
+
+            yield make_chunk({}, finish_reason="tool_calls")
+            yield "data: [DONE]\n\n"
+        else:
+            logger.warning("Tool tag detected but parsing failed — emitting as text")
+            yield emit_text(tool_buffer)
+            yield make_chunk({}, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+    else:
+        if buffer:
+            yield emit_text(buffer)
+
+        if not sent_role:
+            yield make_chunk({"role": "assistant", "content": ""})
+
+        yield make_chunk({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"

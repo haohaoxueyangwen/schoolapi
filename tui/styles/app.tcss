@@ -1,0 +1,139 @@
+/* GenAI Stack TUI - 主题样式 */
+
+Screen {
+    layout: vertical;
+}
+
+/* 主布局：左 Profile 列 + 右详情列 */
+#main-container {
+    layout: horizontal;
+    height: 1fr;
+}
+
+/* 左侧 Profile 列表 */
+#profile-pane {
+    width: 28;
+    border-right: solid $accent;
+    padding: 0 1;
+}
+
+#profile-pane .title {
+    text-style: bold;
+    color: $accent;
+    padding: 1 0 0 0;
+    text-align: center;
+}
+
+#profile-list {
+    height: 1fr;
+    margin: 1 0;
+}
+
+#profile-list > .list-item {
+    padding: 0 1;
+}
+
+#profile-list > .list-item.--highlight {
+    background: $accent 30%;
+}
+
+/* 右侧详情区 */
+#detail-pane {
+    width: 1fr;
+    padding: 0 1;
+}
+
+/* 通用面板样式 */
+.panel {
+    border: solid $primary-background-lighten-2;
+    padding: 1 2;
+    margin: 1 0 0 0;
+    height: auto;
+}
+
+.panel .panel-title {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+/* Profile 详情面板 */
+#profile-detail {
+    height: auto;
+    max-height: 10;
+}
+
+.detail-row {
+    layout: horizontal;
+    height: 1;
+}
+
+.detail-label {
+    width: 12;
+    color: $text-muted;
+}
+
+.detail-value {
+    width: 1fr;
+}
+
+/* 代理状态面板 */
+#proxy-status {
+    height: auto;
+    max-height: 8;
+}
+
+.proxy-row {
+    layout: horizontal;
+    height: 1;
+    margin-bottom: 0;
+}
+
+.proxy-name {
+    width: 24;
+}
+
+.proxy-indicator {
+    width: 10;
+    text-align: center;
+}
+
+.proxy-indicator.running {
+    color: $success;
+}
+
+.proxy-indicator.stopped {
+    color: $error;
+}
+
+/* 模型选择面板 */
+#model-panel {
+    height: 1fr;
+    min-height: 6;
+}
+
+#model-list {
+    height: 1fr;
+}
+
+/* Header 自定义 */
+#status-bar {
+    dock: top;
+    height: 1;
+    background: $accent;
+    color: $text;
+    padding: 0 2;
+    text-style: bold;
+}
+
+/* 按钮行 */
+.button-row {
+    layout: horizontal;
+    height: 3;
+    align: center middle;
+    margin-top: 1;
+}
+
+.button-row Button {
+    margin: 0 1;
+}
