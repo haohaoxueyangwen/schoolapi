@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""GenAI Stack Windows GUI — tkinter-based native desktop interface.
+"""GenAI Stack GUI — tkinter-based native desktop interface (Windows + Linux).
 
-Replaces the Textual TUI on Windows where terminal rendering is unreliable.
 Zero extra dependencies — uses only Python stdlib + tkinter.
+All HTTP operations run in background threads — UI never blocks.
 
 Usage:
     uv run python gui.py
@@ -13,33 +13,23 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
-
-import requests
+from tkinter import filedialog, messagebox, ttk
 
 from tui import config as cfg
-from tui.models import get_models, STATIC_MODELS_GENAI
+from tui.models import get_models
 from tui.proxy import ProxyManager
 from tui.token_utils import jwt_remaining_str
 
 IS_WINDOWS = os.name == "nt"
 
-# ──────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────
 PAD_X = 8
 PAD_Y = 4
-REFRESH_INTERVAL_MS = 5000  # 5 seconds
+REFRESH_INTERVAL_MS = 3000  # 3 seconds (reduced from 5)
 
-
-# ──────────────────────────────────────────────
-# Main Application
-# ──────────────────────────────────────────────
 
 class GenAIStackGUI(tk.Tk):
     """GenAI Stack 桌面管理面板。"""
@@ -48,63 +38,40 @@ class GenAIStackGUI(tk.Tk):
         super().__init__()
 
         self.title("GenAI Stack Dashboard")
-        self.geometry("960x640")
-        self.minsize(800, 500)
-
-        # Set icon / app ID for Windows taskbar
-        if IS_WINDOWS:
-            try:
-                self.iconbitmap(default="")
-            except Exception:
-                pass
+        self.geometry("960x680")
+        self.minsize(800, 520)
 
         self.proxy_mgr = ProxyManager()
         self._current_profile: cfg.Profile | None = None
-        self._refresh_job: str | None = None
+        self._refresh_id: str | None = None
+        self._health_cache: dict[str, bool] = {"shtu_proxy": False, "genai2api": False}
+        self._busy = False  # guard against concurrent refresh
 
-        # ── Style ──
         self._setup_style()
-
-        # ── Menu bar ──
         self._build_menubar()
-
-        # ── Status bar ──
         self._build_statusbar()
-
-        # ── Main paned window ──
         self._build_main()
 
-        # ── Initial data load ──
-        self._refresh_all()
-        self._schedule_refresh()
+        # Async initial load — don't block window appearance
+        self.after(100, self._async_refresh_all)
+        self._schedule_health_refresh()
 
-        # ── Bind close ──
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ═══════════════════════════════════════════
-    # Style
-    # ═══════════════════════════════════════════
+    # ═══════ Style ═══════
 
     def _setup_style(self) -> None:
         self.style = ttk.Style(self)
-        # Try a modern theme on Windows
         if IS_WINDOWS:
-            available = self.style.theme_names()
             for theme in ("vista", "xpnative", "clam"):
-                if theme in available:
+                if theme in self.style.theme_names():
                     self.style.theme_use(theme)
                     break
         self.configure(bg="#f0f0f0")
-
         self.style.configure("Status.TLabel", font=("Segoe UI", 10) if IS_WINDOWS else ("sans-serif", 10))
         self.style.configure("Heading.TLabel", font=("Segoe UI", 11, "bold") if IS_WINDOWS else ("sans-serif", 11, "bold"))
-        self.style.configure("ProxyOk.TLabel", foreground="#228B22")
-        self.style.configure("ProxyDown.TLabel", foreground="#CC0000")
-        self.style.configure("Action.TButton", padding=(12, 4))
 
-    # ═══════════════════════════════════════════
-    # Menu bar
-    # ═══════════════════════════════════════════
+    # ═══════ Menu bar ═══════
 
     def _build_menubar(self) -> None:
         menubar = tk.Menu(self)
@@ -115,7 +82,7 @@ class GenAIStackGUI(tk.Tk):
         file_menu.add_command(label="Edit Profile...", command=self._edit_profile, accelerator="Ctrl+E")
         file_menu.add_command(label="Delete Profile", command=self._delete_profile, accelerator="Del")
         file_menu.add_separator()
-        file_menu.add_command(label="Refresh", command=self._refresh_all, accelerator="F5")
+        file_menu.add_command(label="Refresh (F5)", command=self._async_refresh_all)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close, accelerator="Ctrl+Q")
         menubar.add_cascade(label="File", menu=file_menu)
@@ -126,548 +93,509 @@ class GenAIStackGUI(tk.Tk):
         proxy_menu.add_command(label="Restart Proxy", command=self._restart_proxy)
         menubar.add_cascade(label="Proxy", menu=proxy_menu)
 
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Backup Config...", command=self._backup_config)
+        tools_menu.add_command(label="Restore Config...", command=self._restore_config)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
 
-        # Keyboard shortcuts
         self.bind_all("<Control-n>", lambda e: self._new_profile())
         self.bind_all("<Control-e>", lambda e: self._edit_profile())
         self.bind_all("<Control-q>", lambda e: self._on_close())
-        self.bind_all("<F5>", lambda e: self._refresh_all())
+        self.bind_all("<F5>", lambda e: self._async_refresh_all())
 
-    # ═══════════════════════════════════════════
-    # Status bar
-    # ═══════════════════════════════════════════
+    # ═══════ Status bar ═══════
 
     def _build_statusbar(self) -> None:
         self.status_frame = ttk.Frame(self)
         self.status_frame.pack(side=tk.TOP, fill=tk.X, padx=PAD_X, pady=(PAD_Y, 0))
-
-        self.status_label = ttk.Label(
-            self.status_frame, text="Ready", style="Status.TLabel"
-        )
+        self.status_label = ttk.Label(self.status_frame, text="Ready", style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, fill=tk.X)
 
-    # ═══════════════════════════════════════════
-    # Main layout
-    # ═══════════════════════════════════════════
+    # ═══════ Main layout ═══════
 
     def _build_main(self) -> None:
         pw = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         pw.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=PAD_X, pady=PAD_Y)
-
-        # ── Left: Profiles ──
         self._build_left_panel(pw)
-
-        # ── Right: Detail + Proxy + Model ──
         self._build_right_panel(pw)
-
-        # ── Bottom: Global actions ──
         self._build_bottom_bar()
 
     def _build_left_panel(self, parent: ttk.PanedWindow) -> None:
         frame = ttk.LabelFrame(parent, text="Profiles", padding=4)
         parent.add(frame, weight=1)
 
-        # Listbox + scrollbar
         list_frame = ttk.Frame(frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
         self.profile_listbox = tk.Listbox(
             list_frame,
             font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
-            activestyle="none",
-            exportselection=False,
+            activestyle="none", exportselection=False,
         )
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.profile_listbox.yview)
-        self.profile_listbox.configure(yscrollcommand=scrollbar.set)
-
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.profile_listbox.yview)
+        self.profile_listbox.configure(yscrollcommand=sb.set)
         self.profile_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.profile_listbox.bind("<<ListboxSelect>>", self._on_profile_select)
         self.profile_listbox.bind("<Double-1>", lambda e: self._activate_profile())
 
-        # Profile action buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=(PAD_Y, 0))
-
-        ttk.Button(btn_frame, text="★ Activate", command=self._activate_profile,
-                   style="Action.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="+ New", command=self._new_profile).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="✎ Edit", command=self._edit_profile).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="✕ Delete", command=self._delete_profile).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="🔑 Token", command=self._update_token).pack(side=tk.LEFT, padx=2)
+        for txt, cmd in [("★ Activate", self._activate_profile),
+                         ("+ New", self._new_profile),
+                         ("✎ Edit", self._edit_profile),
+                         ("✕ Delete", self._delete_profile),
+                         ("🔑 Token", self._update_token)]:
+            ttk.Button(btn_frame, text=txt, command=cmd).pack(side=tk.LEFT, padx=1)
 
     def _build_right_panel(self, parent: ttk.PanedWindow) -> None:
-        right_frame = ttk.Frame(parent)
-        parent.add(right_frame, weight=2)
+        rf = ttk.Frame(parent)
+        parent.add(rf, weight=2)
 
-        # ── Profile Detail ──
-        detail_frame = ttk.LabelFrame(right_frame, text="Profile Detail", padding=4)
-        detail_frame.pack(fill=tk.BOTH, expand=True, pady=(0, PAD_Y))
-
-        self.detail_text = tk.Text(
-            detail_frame,
-            height=8,
-            font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
-            state=tk.DISABLED,
-            wrap=tk.WORD,
-        )
+        # Profile Detail
+        df = ttk.LabelFrame(rf, text="Profile Detail", padding=4)
+        df.pack(fill=tk.BOTH, expand=True, pady=(0, PAD_Y))
+        self.detail_text = tk.Text(df, height=7, font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
+                                   state=tk.DISABLED, wrap=tk.WORD)
         self.detail_text.pack(fill=tk.BOTH, expand=True)
 
-        # ── Proxy Status ──
-        proxy_frame = ttk.LabelFrame(right_frame, text="Proxy Status", padding=4)
-        proxy_frame.pack(fill=tk.BOTH, pady=(0, PAD_Y))
-
-        self.proxy_status_text = tk.Text(
-            proxy_frame,
-            height=4,
-            font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
-            state=tk.DISABLED,
-            wrap=tk.WORD,
-        )
+        # Proxy Status
+        pf = ttk.LabelFrame(rf, text="Proxy Status", padding=4)
+        pf.pack(fill=tk.BOTH, pady=(0, PAD_Y))
+        self.proxy_status_text = tk.Text(pf, height=5, font=("Consolas", 10) if IS_WINDOWS else ("monospace", 10),
+                                         state=tk.DISABLED, wrap=tk.WORD)
         self.proxy_status_text.pack(fill=tk.BOTH)
 
-        # ── Model Select ──
-        model_frame = ttk.LabelFrame(right_frame, text="Model Select", padding=4)
-        model_frame.pack(fill=tk.BOTH)
-
-        model_row = ttk.Frame(model_frame)
-        model_row.pack(fill=tk.X, pady=(0, PAD_Y))
-
-        ttk.Label(model_row, text="Model:").pack(side=tk.LEFT, padx=(0, 4))
+        # Model Select
+        mf = ttk.LabelFrame(rf, text="Model Select", padding=4)
+        mf.pack(fill=tk.BOTH)
+        row = ttk.Frame(mf)
+        row.pack(fill=tk.X, pady=(0, PAD_Y))
+        ttk.Label(row, text="Model:").pack(side=tk.LEFT, padx=(0, 4))
         self.model_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(
-            model_row, textvariable=self.model_var, state="readonly", width=30
-        )
+        self.model_combo = ttk.Combobox(row, textvariable=self.model_var, state="readonly", width=30)
         self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_select)
-
-        ttk.Button(model_row, text="Switch Model",
-                   command=self._switch_model).pack(side=tk.RIGHT)
+        ttk.Button(row, text="Switch Model", command=self._switch_model).pack(side=tk.RIGHT)
 
     def _build_bottom_bar(self) -> None:
         bar = ttk.Frame(self)
         bar.pack(side=tk.BOTTOM, fill=tk.X, padx=PAD_X, pady=(0, PAD_Y))
-
-        ttk.Button(bar, text="▶ Start Proxy", command=self._start_proxy,
-                   style="Action.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="■ Stop Proxy", command=self._stop_proxy,
-                   style="Action.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="↻ Restart Proxy", command=self._restart_proxy,
-                   style="Action.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="↺ Refresh", command=self._refresh_all,
-                   style="Action.TButton").pack(side=tk.LEFT, padx=2)
-
-        # Spacer
+        for txt, cmd in [("▶ Start", self._start_proxy),
+                         ("■ Stop", self._stop_proxy),
+                         ("↻ Restart", self._restart_proxy),
+                         ("↺ Refresh", self._async_refresh_all)]:
+            ttk.Button(bar, text=txt, command=cmd).pack(side=tk.LEFT, padx=2)
         ttk.Label(bar, text="").pack(side=tk.LEFT, fill=tk.X, expand=True)
-
         self.auto_refresh_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            bar, text="Auto-refresh (5s)", variable=self.auto_refresh_var,
-            command=self._toggle_auto_refresh
-        ).pack(side=tk.RIGHT)
+        ttk.Checkbutton(bar, text="Auto-refresh (3s)", variable=self.auto_refresh_var).pack(side=tk.RIGHT)
 
-    # ═══════════════════════════════════════════
-    # Data refresh
-    # ═══════════════════════════════════════════
+    # ═══════ Async operations (NON-BLOCKING) ═══════
 
-    def _refresh_all(self) -> None:
-        """Refresh all UI elements from config."""
-        self._refresh_profiles()
-        self._refresh_proxy_status()
-        self._refresh_models()
-        self._update_statusbar()
-        self._update_detail()
+    def _async_refresh_all(self) -> None:
+        """Kick off all async refreshes without blocking."""
+        self._refresh_profiles()       # fast — disk only
+        self._update_statusbar()       # fast
+        self._update_detail()          # fast
+        self._async_health_check()     # background HTTP
+        self._async_refresh_models()   # background HTTP
+
+    def _async_health_check(self) -> None:
+        """Run health checks in background thread, update UI via after()."""
+        def _run() -> dict[str, bool]:
+            return self.proxy_mgr.health_check()
+
+        def _done() -> None:
+            t = getattr(self, '_hc_thread', None)
+            if t and t.is_alive():
+                return  # skip if still running
+            try:
+                health = t.result_cache
+            except AttributeError:
+                return
+            self._health_cache = health
+            shtu = "✓ Running" if health["shtu_proxy"] else "✗ Not running"
+            genai2 = "✓ Running" if health["genai2api"] else "✗ Not running"
+            lines = [
+                f"  SHTUClaudeProxy (:8082):  {shtu}",
+                f"  genai2api (:5000):        {genai2}",
+            ]
+            token = cfg.read_genai_token()
+            if token:
+                try:
+                    lines.append(f"  JWT status:              {jwt_remaining_str(token)}")
+                except Exception:
+                    pass
+            self._set_text(self.proxy_status_text, "\n".join(lines))
+
+        self._hc_thread = threading.Thread(target=lambda: (
+            setattr(self._hc_thread, 'result_cache', _run()),
+            self.after(0, _done),
+        ), daemon=True)
+        self._hc_thread.start()
+
+    def _async_refresh_models(self) -> None:
+        """Fetch models in background thread."""
+        def _run() -> tuple[str | None, int | None, str | None, str | None, bool]:
+            active = cfg.get_active_profile()
+            proxy_port = None
+            profile_type = None
+            profile_url = ""
+            profile_key = ""
+            has_custom = False
+            if active:
+                p = cfg.load_profile(active)
+                if p:
+                    profile_type = p.type
+                    profile_url = p.url
+                    profile_key = p.key
+                    if p.type == "genai" and self._health_cache.get("genai2api", False):
+                        proxy_port = cfg.GENAI2API_PORT
+                    elif p.type in ("genai-api", "openai") and self._health_cache.get("shtu_proxy", False):
+                        proxy_port = cfg.SHTU_PROXY_PORT
+                    if p.type == "anthropic":
+                        has_custom = bool(p.model)
+            return profile_type, proxy_port, profile_url, profile_key, has_custom
+
+        def _done() -> None:
+            profile_type, proxy_port, profile_url, profile_key, has_custom = self._model_fetch_result
+            models = get_models(
+                proxy_port, profile_type, has_custom,
+                profile_url=profile_url, profile_key=profile_key,
+            )
+            flat = []
+            for gm in models.values():
+                flat.extend(gm)
+            self.model_combo["values"] = flat
+
+            active = cfg.get_active_profile()
+            if active:
+                p = cfg.load_profile(active)
+                if p and p.display_model in flat:
+                    self.model_var.set(p.display_model)
+                elif flat:
+                    self.model_var.set(flat[0])
+
+        def _fetch() -> None:
+            self._model_fetch_result = _run()
+            self.after(0, _done)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    # ═══════ Auto-refresh (non-blocking) ═══════
+
+    def _schedule_health_refresh(self) -> None:
+        """Schedule periodic health refresh — async, never blocks UI."""
+        if self.auto_refresh_var.get():
+            self._async_health_check()
+        self._refresh_id = self.after(REFRESH_INTERVAL_MS, self._schedule_health_refresh)
+
+    # ═══════ Sync UI updates (fast, disk only) ═══════
 
     def _refresh_profiles(self) -> None:
-        """Reload the profile listbox."""
         selected = self._get_selected_profile_name()
         self.profile_listbox.delete(0, tk.END)
-
-        profiles = cfg.list_profiles()
         active = cfg.get_active_profile()
-
-        for p in profiles:
+        for p in cfg.list_profiles():
             prefix = "★ " if p.name == active else "  "
-            display = f"{prefix}{p.name:<14} [{p.type}]"
-            self.profile_listbox.insert(tk.END, display)
-
-        # Restore selection
+            self.profile_listbox.insert(tk.END, f"{prefix}{p.name:<14} [{p.type}]")
         if selected:
             for i in range(self.profile_listbox.size()):
-                item = self.profile_listbox.get(i)
-                if selected in item:
+                if selected in self.profile_listbox.get(i):
                     self.profile_listbox.selection_set(i)
                     break
-
-        # Select active if nothing selected
         if not self.profile_listbox.curselection() and self.profile_listbox.size() > 0:
             self.profile_listbox.selection_set(0)
             self._on_profile_select()
 
-    def _refresh_proxy_status(self) -> None:
-        """Update proxy status display."""
-        health = self.proxy_mgr.health_check()
-        shtu = "✓ Running" if health["shtu_proxy"] else "✗ Not running"
-        genai2 = "✓ Running" if health["genai2api"] else "✗ Not running"
-
-        lines = [
-            f"  SHTUClaudeProxy (:8082):  {shtu}",
-            f"  genai2api (:5000):        {genai2}",
-        ]
-
-        token = cfg.read_genai_token()
-        if token:
-            lines.append(f"  JWT status:              {jwt_remaining_str(token)}")
-
-        self._set_text(self.proxy_status_text, "\n".join(lines))
-
-    def _refresh_models(self) -> None:
-        """Reload model dropdown."""
-        active = cfg.get_active_profile()
-        proxy_port = None
-        profile_type = None
-
-        if active:
-            profile = cfg.load_profile(active)
-            if profile:
-                profile_type = profile.type
-                if profile.type == "genai" and self.proxy_mgr.is_genai2api_running():
-                    proxy_port = cfg.GENAI2API_PORT
-                elif profile.type in ("genai-api", "openai") and self.proxy_mgr.is_shtu_running():
-                    proxy_port = cfg.SHTU_PROXY_PORT
-
-        models = get_models(proxy_port, profile_type)
-        flat_models: list[str] = []
-        for group_models in models.values():
-            flat_models.extend(group_models)
-
-        self.model_combo["values"] = flat_models
-
-        # Set current model
-        current = ""
-        if active:
-            profile = cfg.load_profile(active)
-            if profile:
-                current = profile.display_model
-        if current and current in flat_models:
-            self.model_var.set(current)
-        elif flat_models:
-            self.model_var.set(flat_models[0])
-
     def _update_statusbar(self) -> None:
-        """Update the top status bar."""
         active = cfg.get_active_profile()
         if active and cfg.profile_exists(active):
-            profile = cfg.load_profile(active)
-            if profile:
-                model_str = profile.display_model
+            p = cfg.load_profile(active)
+            if p:
                 self.status_label.configure(
-                    text=f"★ Active: {active}  |  Type: {profile.type}  |  Model: {model_str}"
+                    text=f"★ Active: {active}  |  Type: {p.type}  |  Model: {p.display_model}"
                 )
                 return
         self.status_label.configure(text="No active profile. Select one and click ★ Activate.")
 
     def _update_detail(self) -> None:
-        """Update profile detail pane."""
         name = self._get_selected_profile_name()
         if not name:
             self._set_text(self.detail_text, "(no profile selected)")
             return
-
-        profile = cfg.load_profile(name)
-        if not profile:
+        p = cfg.load_profile(name)
+        if not p:
             return
-
-        data = profile.to_json()
+        data = p.to_json()
         lines = []
         for k, v in data.items():
             if k == "key" and v:
                 v = v if len(v) <= 16 else v[:12] + f"...({len(v)} chars)"
             lines.append(f"  {k}: {v}")
-
         self._set_text(self.detail_text, "\n".join(lines))
-        self._current_profile = profile
+        self._current_profile = p
 
-    # ═══════════════════════════════════════════
-    # Auto-refresh
-    # ═══════════════════════════════════════════
-
-    def _schedule_refresh(self) -> None:
-        """Schedule periodic proxy status refresh."""
-        if self.auto_refresh_var.get():
-            self._refresh_proxy_status()
-        self._refresh_job = self.after(REFRESH_INTERVAL_MS, self._schedule_refresh)
-
-    def _toggle_auto_refresh(self) -> None:
-        """Toggle auto-refresh on/off."""
-        if self.auto_refresh_var.get():
-            self._schedule_refresh()
-
-    # ═══════════════════════════════════════════
-    # Profile actions
-    # ═══════════════════════════════════════════
+    # ═══════ Profile actions ═══════
 
     def _get_selected_profile_name(self) -> str | None:
-        """Extract profile name from listbox selection."""
         sel = self.profile_listbox.curselection()
         if not sel:
             return None
-        item = self.profile_listbox.get(sel[0])
-        # Strip ★ marker
-        name_part = item.lstrip("★ ").split()[0].strip()
-        return name_part if name_part else None
+        return self.profile_listbox.get(sel[0]).lstrip("★ ").split()[0].strip() or None
 
     def _on_profile_select(self, event=None) -> None:
-        """Handle profile selection in listbox."""
         self._update_detail()
-        name = self._get_selected_profile_name()
-        if name:
-            profile = cfg.load_profile(name)
-            if profile:
-                self._current_profile = profile
 
     def _activate_profile(self) -> None:
-        """Activate the selected profile."""
         name = self._get_selected_profile_name()
         if not name:
-            messagebox.showwarning("Activate", "Please select a profile first.")
+            messagebox.showwarning("Activate", "Please select a profile first."); return
+        if not messagebox.askyesno("Activate", f"Activate '{name}'?\nWill stop current proxies and switch config."):
             return
-
-        # Confirm
-        if not messagebox.askyesno(
-            "Activate Profile",
-            f"Activate profile '{name}'?\n\nThis will stop current proxies and switch configuration."
-        ):
+        p = cfg.load_profile(name)
+        if not p:
             return
-
-        profile = cfg.load_profile(name)
-        if not profile:
-            return
-
-        # Run in background thread
         self.status_label.configure(text=f"Switching to {name}...")
-        threading.Thread(target=self._do_activate, args=(profile,), daemon=True).start()
+        self._busy = True
 
-    def _do_activate(self, profile: cfg.Profile) -> None:
-        """Background: activate profile."""
-        ok, msg = self.proxy_mgr.smart_switch(profile)
-        self.after(0, lambda: self._on_activate_done(ok, msg, profile))
+        def _run():
+            ok, msg = self.proxy_mgr.smart_switch(p)
+            self.after(0, lambda: self._on_activate_done(ok, msg, p))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _on_activate_done(self, ok: bool, msg: str, profile: cfg.Profile) -> None:
-        """UI update after activation."""
+        self._busy = False
         if ok:
             self.status_label.configure(text=f"✓ {msg}. Restart Claude Code to take effect.")
         else:
             messagebox.showerror("Activation Failed", msg)
-            self.status_label.configure(text=f"✗ {msg}")
-        self._refresh_all()
+        self._async_refresh_all()
 
     def _new_profile(self) -> None:
-        """Open dialog to create a new profile."""
-        dialog = ProfileDialog(self, title="New Profile")
-        self.wait_window(dialog)
-        if dialog.result:
-            profile = dialog.result
-            cfg.save_profile(profile)
-            self._refresh_all()
-            self.status_label.configure(text=f"✓ Profile '{profile.name}' created.")
+        dlg = ProfileDialog(self, title="New Profile")
+        self.wait_window(dlg)
+        if dlg.result:
+            cfg.save_profile(dlg.result)
+            self._async_refresh_all()
+            self.status_label.configure(text=f"✓ Profile '{dlg.result.name}' created.")
 
     def _edit_profile(self) -> None:
-        """Edit selected profile."""
         name = self._get_selected_profile_name()
-        if not name:
-            messagebox.showwarning("Edit", "Please select a profile first.")
-            return
-        profile = cfg.load_profile(name)
-        if not profile:
-            return
-
-        dialog = ProfileDialog(self, title=f"Edit Profile: {name}", edit_profile=profile)
-        self.wait_window(dialog)
-        if dialog.result:
-            cfg.save_profile(dialog.result)
-            self._refresh_all()
-            self.status_label.configure(text=f"✓ Profile '{dialog.result.name}' updated.")
+        if not name: messagebox.showwarning("Edit", "Select a profile."); return
+        p = cfg.load_profile(name)
+        if not p: return
+        dlg = ProfileDialog(self, title=f"Edit: {name}", edit_profile=p)
+        self.wait_window(dlg)
+        if dlg.result:
+            cfg.save_profile(dlg.result)
+            self._async_refresh_all()
+            self.status_label.configure(text=f"✓ Profile '{dlg.result.name}' updated.")
 
     def _delete_profile(self) -> None:
-        """Delete selected profile."""
         name = self._get_selected_profile_name()
-        if not name:
-            messagebox.showwarning("Delete", "Please select a profile first.")
-            return
-        active = cfg.get_active_profile()
-        if name == active:
-            messagebox.showerror("Delete", f"Cannot delete active profile '{name}'.\nSwitch to another first.")
-            return
-        if messagebox.askyesno("Delete Profile", f"Are you sure you want to delete profile '{name}'?", icon="warning"):
+        if not name: messagebox.showwarning("Delete", "Select a profile."); return
+        if name == cfg.get_active_profile():
+            messagebox.showerror("Delete", f"'{name}' is active. Switch first."); return
+        if messagebox.askyesno("Delete", f"Delete '{name}'?", icon="warning"):
             cfg.delete_profile(name)
-            self._current_profile = None
-            self._refresh_all()
+            self._async_refresh_all()
             self.status_label.configure(text=f"✓ Profile '{name}' deleted.")
 
     def _update_token(self) -> None:
-        """Update token for selected profile."""
         name = self._get_selected_profile_name()
-        if not name:
-            messagebox.showwarning("Update Token", "Please select a profile first.")
-            return
-        profile = cfg.load_profile(name)
-        if not profile:
-            return
-
-        dialog = TokenDialog(self, title=f"Update Token: {name}", current_token=profile.key)
-        self.wait_window(dialog)
-        if dialog.result:
-            profile.key = dialog.result
-            cfg.save_profile(profile)
-
+        if not name: messagebox.showwarning("Token", "Select a profile."); return
+        p = cfg.load_profile(name)
+        if not p: return
+        dlg = TokenDialog(self, title=f"Update Token: {name}", current_token=p.key)
+        self.wait_window(dlg)
+        if dlg.result:
+            p.key = dlg.result
+            cfg.save_profile(p)
             active = cfg.get_active_profile()
             if name == active:
-                if profile.type == "genai":
-                    cfg.write_genai_token(dialog.result)
-                elif profile.type == "genai-api":
-                    cfg.write_shtu_proxy_config(profile)
-
-            self._refresh_all()
+                if p.type == "genai": cfg.write_genai_token(dlg.result)
+                elif p.type == "genai-api": cfg.write_shtu_proxy_config(p)
+            self._async_refresh_all()
             self.status_label.configure(text=f"✓ Token updated for '{name}'.")
 
-    # ═══════════════════════════════════════════
-    # Model actions
-    # ═══════════════════════════════════════════
-
-    def _on_model_select(self, event=None) -> None:
-        """Model selected in dropdown — just store, don't switch yet."""
-        pass
+    # ═══════ Model ═══════
 
     def _switch_model(self) -> None:
-        """Switch to the selected model."""
         model = self.model_var.get()
-        if not model:
-            messagebox.showwarning("Switch Model", "Please select a model first.")
-            return
-
+        if not model: messagebox.showwarning("Model", "Select a model."); return
         active = cfg.get_active_profile()
-        if not active:
-            messagebox.showwarning("Switch Model", "No active profile.")
+        if not active: messagebox.showwarning("Model", "No active profile."); return
+        p = cfg.load_profile(active)
+        if not p: return
+        if not messagebox.askyesno("Switch Model", f"Switch '{active}' to '{model}'?\nMay restart proxies."):
             return
-
-        profile = cfg.load_profile(active)
-        if not profile:
-            return
-
-        if not messagebox.askyesno(
-            "Switch Model",
-            f"Switch active profile '{active}' to model '{model}'?\n\nThis may restart proxies."
-        ):
-            return
-
         self.status_label.configure(text=f"Switching model to {model}...")
-        threading.Thread(target=self._do_switch_model, args=(profile, model), daemon=True).start()
 
-    def _do_switch_model(self, profile: cfg.Profile, model: str) -> None:
-        """Background: switch model."""
-        ok, msg = self.proxy_mgr.switch_model(profile, model)
-        self.after(0, lambda: self._on_switch_model_done(ok, msg))
+        def _run():
+            ok, msg = self.proxy_mgr.switch_model(p, model)
+            self.after(0, lambda: self._on_switch_done(ok, msg))
 
-    def _on_switch_model_done(self, ok: bool, msg: str) -> None:
-        """UI update after model switch."""
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_switch_done(self, ok: bool, msg: str) -> None:
         if ok:
             self.status_label.configure(text=f"✓ {msg}")
         else:
             messagebox.showerror("Switch Failed", msg)
-            self.status_label.configure(text=f"✗ {msg}")
-        self._refresh_all()
+        self._async_refresh_all()
 
-    # ═══════════════════════════════════════════
-    # Proxy actions
-    # ═══════════════════════════════════════════
+    # ═══════ Proxy ═══════
 
     def _start_proxy(self) -> None:
-        """Start proxy for active profile."""
         active = cfg.get_active_profile()
-        if not active:
-            messagebox.showwarning("Start Proxy", "No active profile. Activate one first.")
-            return
-        profile = cfg.load_profile(active)
-        if not profile:
-            return
-
+        if not active: messagebox.showwarning("Start", "No active profile."); return
+        p = cfg.load_profile(active)
+        if not p: return
         self.status_label.configure(text="Starting proxy...")
-        threading.Thread(target=self._do_start, args=(profile,), daemon=True).start()
+        self._busy = True
 
-    def _do_start(self, profile: cfg.Profile) -> None:
-        ok = self.proxy_mgr.smart_start(profile)
-        msg = "Proxy started ✓" if ok else "Proxy start failed ✗"
-        self.after(0, lambda: self.status_label.configure(text=msg))
-        self.after(100, self._refresh_proxy_status)
+        def _run():
+            ok = self.proxy_mgr.smart_start(p)
+            self.after(0, lambda: self._on_proxy_done("✓ Proxy started" if ok else "✗ Start failed", ok))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _stop_proxy(self) -> None:
-        """Stop all proxies."""
-        self.proxy_mgr.stop_all()
-        self._refresh_proxy_status()
-        self.status_label.configure(text="All proxies stopped.")
+        self._busy = True
+
+        def _run():
+            self.proxy_mgr.stop_all()
+            self.after(0, lambda: self._on_proxy_done("All proxies stopped.", True))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _restart_proxy(self) -> None:
-        """Restart proxy for active profile."""
         active = cfg.get_active_profile()
-        if not active:
-            messagebox.showwarning("Restart Proxy", "No active profile.")
-            return
-        profile = cfg.load_profile(active)
-        if not profile:
-            return
-
+        if not active: messagebox.showwarning("Restart", "No active profile."); return
+        p = cfg.load_profile(active)
+        if not p: return
         self.status_label.configure(text="Restarting proxy...")
-        threading.Thread(target=self._do_restart, args=(profile,), daemon=True).start()
+        self._busy = True
 
-    def _do_restart(self, profile: cfg.Profile) -> None:
-        self.proxy_mgr.stop_all()
-        time.sleep(1)
-        ok = self.proxy_mgr.smart_start(profile)
-        msg = "Proxy restarted ✓" if ok else "Proxy restart failed ✗"
-        self.after(0, lambda: self.status_label.configure(text=msg))
-        self.after(100, self._refresh_proxy_status)
+        def _run():
+            self.proxy_mgr.stop_all()
+            time.sleep(1)
+            ok = self.proxy_mgr.smart_start(p)
+            self.after(0, lambda: self._on_proxy_done("✓ Proxy restarted" if ok else "✗ Restart failed", ok))
 
-    # ═══════════════════════════════════════════
-    # Helpers
-    # ═══════════════════════════════════════════
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_proxy_done(self, msg: str, ok: bool) -> None:
+        self._busy = False
+        self.status_label.configure(text=msg)
+        self._async_health_check()
+
+    # ═══════ Config backup / restore ═══════
+
+    def _backup_config(self) -> None:
+        """Export all profiles to a portable JSON file."""
+        path = filedialog.asksaveasfilename(
+            title="Backup Config",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="genai-stack-backup.json",
+        )
+        if not path:
+            return
+        profiles_data = {}
+        for p in cfg.list_profiles():
+            profiles_data[p.name] = p.to_json()
+        backup = {
+            "version": "7.0.0",
+            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "active_profile": cfg.get_active_profile(),
+            "profiles": profiles_data,
+        }
+        try:
+            Path(path).write_text(json.dumps(backup, indent=2, ensure_ascii=False), encoding="utf-8")
+            messagebox.showinfo("Backup", f"Exported {len(profiles_data)} profiles to:\n{path}")
+            self.status_label.configure(text=f"✓ Config backed up to {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Backup Failed", str(e))
+
+    def _restore_config(self) -> None:
+        """Import profiles from a backup JSON file."""
+        path = filedialog.askopenfilename(
+            title="Restore Config",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror("Restore Failed", f"Cannot read file:\n{e}")
+            return
+
+        profiles_data = data.get("profiles", {})
+        if not profiles_data:
+            messagebox.showwarning("Restore", "No profiles found in backup file.")
+            return
+
+        count = 0
+        skipped = 0
+        for name, pdata in profiles_data.items():
+            if cfg.profile_exists(name):
+                if not messagebox.askyesno("Restore", f"Profile '{name}' already exists. Overwrite?"):
+                    skipped += 1
+                    continue
+            cfg.save_profile(cfg.Profile(
+                name=name,
+                type=pdata.get("type", ""),
+                url=pdata.get("url", ""),
+                key=pdata.get("key", ""),
+                model=pdata.get("model", ""),
+                big_model=pdata.get("big_model", ""),
+                middle_model=pdata.get("middle_model", ""),
+                small_model=pdata.get("small_model", ""),
+            ))
+            count += 1
+
+        # Optionally restore active profile
+        active = data.get("active_profile")
+        if active and active in profiles_data:
+            if messagebox.askyesno("Restore", f"Set '{active}' as active profile?"):
+                cfg.set_active_profile(active)
+
+        self._async_refresh_all()
+        messagebox.showinfo("Restore", f"Restored {count} profiles. (Skipped: {skipped})")
+        self.status_label.configure(text=f"✓ Restored {count} profiles from {os.path.basename(path)}")
+
+    # ═══════ Helpers ═══════
 
     @staticmethod
     def _set_text(widget: tk.Text, text: str) -> None:
-        """Set text widget content (read-only)."""
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         widget.insert("1.0", text)
         widget.configure(state=tk.DISABLED)
 
     def _show_about(self) -> None:
-        messagebox.showinfo(
-            "About GenAI Stack",
-            "GenAI Stack Dashboard\n\n"
-            "Multi-mode AI backend proxy management.\n"
-            "Supports: Anthropic | GenAI JWT | GenAI API key\n\n"
-            "Version: 7.0.0\n"
-            "License: MIT"
-        )
+        messagebox.showinfo("About", "GenAI Stack v7.0.0\n\n"
+                            "Multi-mode AI backend proxy management.\n"
+                            "Anthropic | GenAI JWT | GenAI API key")
 
     def _on_close(self) -> None:
-        """Handle window close — don't kill proxies, just quit GUI."""
-        if self._refresh_job:
-            self.after_cancel(self._refresh_job)
+        if self._refresh_id:
+            self.after_cancel(self._refresh_id)
         self.destroy()
 
 
-# ──────────────────────────────────────────────
+# ────────────────────────────────────
 # Profile Dialog
-# ──────────────────────────────────────────────
+# ────────────────────────────────────
 
 class ProfileDialog(tk.Toplevel):
-    """Modal dialog for creating/editing a profile."""
-
     def __init__(self, parent: tk.Tk, title: str = "Profile",
                  edit_profile: cfg.Profile | None = None) -> None:
         super().__init__(parent)
@@ -675,155 +603,113 @@ class ProfileDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-
         self.result: cfg.Profile | None = None
-        self._edit_profile = edit_profile
         self._editing = edit_profile is not None
 
-        self._build_ui()
-        self._center_on(parent)
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill=tk.BOTH)
 
-        if edit_profile:
-            self._load_profile(edit_profile)
-
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-
-    def _build_ui(self) -> None:
-        frame = ttk.Frame(self, padding=16)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Name
-        ttk.Label(frame, text="Profile Name:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="Name:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.name_var = tk.StringVar()
-        self.name_entry = ttk.Entry(frame, textvariable=self.name_var, width=30)
+        self.name_entry = ttk.Entry(f, textvariable=self.name_var, width=32)
         self.name_entry.grid(row=0, column=1, sticky=tk.EW, pady=2)
         if self._editing:
             self.name_entry.configure(state=tk.DISABLED)
 
-        # Type
-        ttk.Label(frame, text="Type:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="Type:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.type_var = tk.StringVar(value="genai")
-        self.type_combo = ttk.Combobox(
-            frame, textvariable=self.type_var, state="readonly",
-            values=["anthropic", "genai", "genai-api", "openai"]
-        )
-        self.type_combo.grid(row=1, column=1, sticky=tk.EW, pady=2)
-        self.type_combo.bind("<<ComboboxSelected>>", self._on_type_change)
+        cb = ttk.Combobox(f, textvariable=self.type_var, state="readonly",
+                          values=["anthropic", "genai", "genai-api", "openai"])
+        cb.grid(row=1, column=1, sticky=tk.EW, pady=2)
+        cb.bind("<<ComboboxSelected>>", self._on_type_change)
         if self._editing:
-            self.type_combo.configure(state=tk.DISABLED)
+            cb.configure(state=tk.DISABLED)
 
-        # URL
-        ttk.Label(frame, text="URL:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="URL:").grid(row=2, column=0, sticky=tk.W, pady=2)
         self.url_var = tk.StringVar()
-        self.url_entry = ttk.Entry(frame, textvariable=self.url_var, width=40)
+        self.url_entry = ttk.Entry(f, textvariable=self.url_var, width=42)
         self.url_entry.grid(row=2, column=1, sticky=tk.EW, pady=2)
 
-        # Key / Token
-        ttk.Label(frame, text="Key / Token:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="Key / Token:").grid(row=3, column=0, sticky=tk.W, pady=2)
         self.key_var = tk.StringVar()
-        self.key_entry = ttk.Entry(frame, textvariable=self.key_var, width=40)
+        self.key_entry = ttk.Entry(f, textvariable=self.key_var, width=42)
         self.key_entry.grid(row=3, column=1, sticky=tk.EW, pady=2)
 
-        # Big model
-        ttk.Label(frame, text="Big Model (opus):").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="Big Model:").grid(row=4, column=0, sticky=tk.W, pady=2)
         self.big_var = tk.StringVar(value="GPT-5.5")
-        self.big_entry = ttk.Entry(frame, textvariable=self.big_var, width=30)
+        self.big_entry = ttk.Entry(f, textvariable=self.big_var, width=32)
         self.big_entry.grid(row=4, column=1, sticky=tk.EW, pady=2)
 
-        # Middle model
-        ttk.Label(frame, text="Middle Model (sonnet):").grid(row=5, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="Middle Model:").grid(row=5, column=0, sticky=tk.W, pady=2)
         self.mid_var = tk.StringVar()
-        self.mid_entry = ttk.Entry(frame, textvariable=self.mid_var, width=30)
+        self.mid_entry = ttk.Entry(f, textvariable=self.mid_var, width=32)
         self.mid_entry.grid(row=5, column=1, sticky=tk.EW, pady=2)
 
-        # Small model
-        ttk.Label(frame, text="Small Model (haiku):").grid(row=6, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f, text="Small Model:").grid(row=6, column=0, sticky=tk.W, pady=2)
         self.small_var = tk.StringVar()
-        self.small_entry = ttk.Entry(frame, textvariable=self.small_var, width=30)
+        self.small_entry = ttk.Entry(f, textvariable=self.small_var, width=32)
         self.small_entry.grid(row=6, column=1, sticky=tk.EW, pady=2)
 
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=7, column=0, columnspan=2, pady=(12, 0))
+        bf = ttk.Frame(f)
+        bf.grid(row=7, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(bf, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(btn_frame, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
-
+        if edit_profile:
+            self._load(edit_profile)
         self._on_type_change()
+        self._center(parent)
 
-    def _on_type_change(self, event=None) -> None:
-        """Enable/disable fields based on type."""
-        ptype = self.type_var.get()
-        # URL: needed for anthropic, genai-api, openai; not for genai
-        needs_url = ptype in ("anthropic", "genai-api", "openai")
+    def _on_type_change(self, e=None) -> None:
+        needs_url = self.type_var.get() in ("anthropic", "genai-api", "openai")
         self.url_entry.configure(state=tk.NORMAL if needs_url else tk.DISABLED)
-        # Big/Mid/Small models: needed for genai, genai-api, openai
-        needs_models = ptype != "anthropic"
-        state = tk.NORMAL if needs_models else tk.DISABLED
-        self.big_entry.configure(state=state)
-        self.mid_entry.configure(state=state)
-        self.small_entry.configure(state=state)
+        needs_models = self.type_var.get() != "anthropic"
+        st = tk.NORMAL if needs_models else tk.DISABLED
+        self.big_entry.configure(state=st)
+        self.mid_entry.configure(state=st)
+        self.small_entry.configure(state=st)
 
-    def _load_profile(self, profile: cfg.Profile) -> None:
-        self.name_var.set(profile.name)
-        self.type_var.set(profile.type)
-        self.url_var.set(profile.url)
-        self.key_var.set(profile.key)
-        self.big_var.set(profile.big_model)
-        self.mid_var.set(profile.middle_model)
-        self.small_var.set(profile.small_model)
+    def _load(self, p: cfg.Profile) -> None:
+        self.name_var.set(p.name)
+        self.type_var.set(p.type)
+        self.url_var.set(p.url)
+        self.key_var.set(p.key)
+        self.big_var.set(p.big_model)
+        self.mid_var.set(p.middle_model)
+        self.small_var.set(p.small_model)
 
     def _on_ok(self) -> None:
         name = self.name_var.get().strip()
         ptype = self.type_var.get().strip()
-
         if not name:
-            messagebox.showwarning("Validation", "Profile name is required.", parent=self)
-            return
+            messagebox.showwarning("Validation", "Name required.", parent=self); return
         if not self._editing and cfg.profile_exists(name):
-            messagebox.showwarning("Validation", f"Profile '{name}' already exists.", parent=self)
-            return
-
+            messagebox.showwarning("Validation", f"'{name}' exists.", parent=self); return
         big = self.big_var.get().strip()
         mid = self.mid_var.get().strip() or big
         small = self.small_var.get().strip() or big
-
         if ptype == "anthropic":
-            model = self.big_var.get().strip() or "opus"
-            self.result = cfg.Profile(
-                name=name, type=ptype,
-                url=self.url_var.get().strip(),
-                key=self.key_var.get().strip(),
-                model=model,
-            )
+            self.result = cfg.Profile(name=name, type=ptype, url=self.url_var.get().strip(),
+                                      key=self.key_var.get().strip(), model=big or "opus")
         else:
-            self.result = cfg.Profile(
-                name=name, type=ptype,
-                url=self.url_var.get().strip(),
-                key=self.key_var.get().strip(),
-                big_model=big, middle_model=mid, small_model=small,
-            )
-
+            self.result = cfg.Profile(name=name, type=ptype, url=self.url_var.get().strip(),
+                                      key=self.key_var.get().strip(),
+                                      big_model=big, middle_model=mid, small_model=small)
         self.destroy()
 
-    def _center_on(self, parent: tk.Tk) -> None:
-        """Center dialog on parent window."""
+    def _center(self, parent: tk.Tk) -> None:
         self.update_idletasks()
         pw, ph = parent.winfo_width(), parent.winfo_height()
         px, py = parent.winfo_rootx(), parent.winfo_rooty()
         w, h = self.winfo_width(), self.winfo_height()
-        x = px + (pw - w) // 2
-        y = py + (ph - h) // 2
-        self.geometry(f"+{x}+{y}")
+        self.geometry(f"+{px+(pw-w)//2}+{py+(ph-h)//2}")
 
 
-# ──────────────────────────────────────────────
+# ────────────────────────────────────
 # Token Dialog
-# ──────────────────────────────────────────────
+# ────────────────────────────────────
 
 class TokenDialog(tk.Toplevel):
-    """Modal dialog for updating a profile token/key."""
-
     def __init__(self, parent: tk.Tk, title: str = "Update Token",
                  current_token: str = "") -> None:
         super().__init__(parent)
@@ -831,57 +717,39 @@ class TokenDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-
         self.result: str | None = None
 
-        frame = ttk.Frame(self, padding=16)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(frame, text="New Token / Key:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill=tk.BOTH)
+        ttk.Label(f, text="New Token:").grid(row=0, column=0, sticky=tk.W, pady=4)
         self.token_var = tk.StringVar(value=current_token)
-        self.token_entry = ttk.Entry(frame, textvariable=self.token_var, width=50)
+        self.token_entry = ttk.Entry(f, textvariable=self.token_var, width=50)
         self.token_entry.grid(row=0, column=1, sticky=tk.EW, pady=4, padx=(8, 0))
-
-        ttk.Label(
-            frame,
-            text="Supports: JWT (eyJ...) or student_id@password",
-            font=("Segoe UI", 8) if IS_WINDOWS else ("sans-serif", 8),
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
-
-        btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=2, column=0, columnspan=2)
-
-        ttk.Button(btn_frame, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
-
-        self._center_on(parent)
+        ttk.Label(f, text="JWT (eyJ...) or student_id@password",
+                  font=("Segoe UI", 8) if IS_WINDOWS else ("sans-serif", 8),
+                 ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        bf = ttk.Frame(f)
+        bf.grid(row=2, column=0, columnspan=2)
+        ttk.Button(bf, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
+        self._center(parent)
         self.token_entry.focus_set()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def _on_ok(self) -> None:
         token = self.token_var.get().strip()
-        if not token:
-            messagebox.showwarning("Validation", "Token cannot be empty.", parent=self)
-            return
+        if not token: messagebox.showwarning("Validation", "Token empty.", parent=self); return
         self.result = token
         self.destroy()
 
-    def _center_on(self, parent: tk.Tk) -> None:
+    def _center(self, parent: tk.Tk) -> None:
         self.update_idletasks()
         pw, ph = parent.winfo_width(), parent.winfo_height()
         px, py = parent.winfo_rootx(), parent.winfo_rooty()
         w, h = self.winfo_width(), self.winfo_height()
-        x = px + (pw - w) // 2
-        y = py + (ph - h) // 2
-        self.geometry(f"+{x}+{y}")
+        self.geometry(f"+{px+(pw-w)//2}+{py+(ph-h)//2}")
 
-
-# ──────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────
 
 def main() -> None:
-    """Launch the Windows GUI."""
     app = GenAIStackGUI()
     app.mainloop()
 
